@@ -113,28 +113,53 @@ Run the bug test under both Prometheus profiles. `profile-oom` shows the pipelin
 
 **What's measured, from inside the app:** every OTLP export is wrapped. The measurement covers serialize + send + retries, the points per export, and the bytes, status code and retries for each HTTP attempt. The console reads this directly every 2s, the report charts it, and Grafana shows it under Deep Dive → "6 · Export path".
 
-**Agent profiles:**
+**Agent profiles.** Add `PROTECT_PROM=1` to either one so Alloy drops high-cardinality series (`response_time` or GUID labels) just before remote_write. The app → Alloy back pressure is unchanged, but Prometheus doesn't crash-loop, so Grafana keeps working during the run.
 
 | Command | Alloy | Effect |
 |---|---|---|
-| `make agent-normal` (default) | 1Gi, no CPU limit, no memory_limiter | Keeps up; no back pressure |
-| `make agent-constrained` | 250m CPU / 384Mi + memory_limiter (70%) | Slows down and refuses data with HTTP 503. The app retries, holding payloads in memory (`OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=in_memory`). |
+| `make agent-normal PROTECT_PROM=1` | 1Gi, no CPU limit, no memory_limiter | Usually keeps up (it can still OOM on very large payloads) |
+| `make agent-constrained PROTECT_PROM=1` | 250m CPU / 384Mi + memory_limiter (70%) | Slows down and refuses data with HTTP 503. The app retries, holding payloads in memory (`OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=in_memory`). |
 
-**The 2×2 matrix.** Use the same ramp for every run and click **Restart replicas** before each one:
+### Hypothesis tests panel (one click per run)
 
-| | `make agent-normal` | `make agent-constrained` |
-|---|---|---|
-| **Bounded preset** | baseline capacity | back pressure alone |
-| **+ response_time preset** | cardinality alone | **cardinality + back pressure** |
+The console's **Hypothesis tests** panel runs **constant-rate soaks** at a percentage of measured capacity. Load stays fixed, so anything that gets worse over time comes from growing cardinality and export cost, not from more traffic. A ramp mixes the two together.
 
-**Verdict:** each report includes a **Metrics back pressure** finding.
-- **CONFIRMED** needs all of the following, and no other failure (such as GC heap pre-allocation) explaining it:
-  - the app degraded
-  - the export path was under pressure: duration at least 50% of the 8s timeout, or any failures or retries
-  - the pods showed CPU contention: throttling at least 25%, or CPU pinned
-- **PARTIAL** or **NOT CONFIRMED** otherwise, with the reason.
+Each button first does **Reset everything**:
+1. restarts the app replicas, which clears SDK series
+2. restarts Alloy, which clears its WAL and series cache
+3. wipes Prometheus
 
-The finding also reports the correlation between export cost and client p95.
+Then it waits for all three to be ready, applies the labels, waits one export cycle, and starts the run with an automatic name and notes.
+
+| Level | Load | Duration | Hypothesis labels | Agent |
+|---|---|---|---|---|
+| L1 | 60% of capacity | 10 min | all 5 incl. `response_time` (6 dp) | normal |
+| L2 | 60% | 10 min | + 3 unique GUID labels | normal |
+| L3 | 70% | 15 min | + 5 unique GUID labels | normal |
+| L4 | 70% | 15 min | + 5 unique GUID labels | **constrained** |
+| L5 | 80% | 20 min | + 5 unique GUID labels | **constrained** |
+
+- Run **Run control (bounded)** and **Run hypothesis** at the same level, then compare them in Run history.
+- The panel shows the agent each level needs, and the command to switch to it.
+- **Capacity** defaults to 2,350 req/s, the knee measured with `CPU_WORK_ITERATIONS=1000` (≈1.7–2.4 ms CPU per request, 4 × 1-core pods). Each report's "Request-only capacity" finding re-measures it. Update the field if you change the CPU work, which is set in `k8s/app.yaml`, not with `kubectl set env`, because `make app` re-applies the manifest.
+- **If a level passes, move to the next.** The app staying healthy, or a PARTIAL / NOT CONFIRMED verdict, both count as passing.
+
+**Extra GUID labels** (console label panel, 0–5): `request_id`, `trace_id`, `session_id`, `correlation_id`, `tenant_id`.
+- **Values:** unique per request, or a pool of 10 / 100 / 1,000 / 10,000 random GUIDs. Changing the setting regenerates them.
+- **Why they add pressure:** each one adds about 40 bytes to *every* series (3 labels roughly doubled the bytes per point), so they make each export bigger and costlier to serialize, independently of series count.
+
+**Verdict.** Each report includes a **Metrics back pressure** finding.
+- **Soaks** compare the first and last quarter at constant load: CPU, throttling, export cost, p95 and failures. **CONFIRMED** needs all three of these to rise, with CPU not already near the limit early on:
+  - latency (p95 doubles, or failures appear)
+  - export cost
+  - CPU or throttling
+- **Ramps** need all of the following for **CONFIRMED**:
+  - degradation
+  - export pressure (at least 50% of the 8s timeout, or retries)
+  - CPU contention
+  - export pressure that **started before** the degradation
+  - request CPU alone, projected from the low-load part of the run, **below the limit** at the degradation point
+- Otherwise the report says **Load saturation** (requests alone hit the CPU limit) or **PARTIAL**, with the reason.
 
 **Cardinality limit scope:** `OTEL_CARDINALITY_LIMIT_SCOPE=transactions` (the default) applies the 200k limit only to `http_transactions_total`. With `all`, the SDK pre-allocates storage for every instrument: about 560 MiB, or 97% of the GC heap limit. The app then dies of `OutOfMemoryException` before any back pressure can build. That's a separate finding.
 
@@ -146,7 +171,7 @@ Once the failure reproduces, use the label controls in the console to reduce car
 2. Then `pod` (about 200 values): drop it, or rely on the resource's `instance`.
 3. Then `product`, `state`, `consume_type`, if needed.
 
-Click **Apply labels**, then **Restart replicas** before each run. With cumulative temporality, removing a label doesn't free the series the SDK already holds; only a restart does.
+Click **Apply labels**, then **Reset everything** (or **Restart replicas**) before each run. With cumulative temporality, removing a label doesn't free the series the SDK already holds; only a restart does.
 
 ## Reproducing the incident with make targets
 
@@ -187,6 +212,7 @@ app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs
 agent/config.alloy           Alloy pipeline, unguarded (production-like)
 agent/config-guarded.alloy   Alloy pipeline with memory_limiter + relabel drop
 agent/config-constrained.alloy + values-constrained.yaml   "constrained" agent profile (back pressure)
+agent/config*-protect.alloy  same pipelines + drop high-cardinality series before Prometheus (PROTECT_PROM=1)
 agent/values.yaml            Alloy chart values: agent node pool, OTLP ports, 1Gi limit
 cluster/k3d-config.yaml      k3d cluster (app pool); `make up` adds the agent pool node
 monitoring/values.yaml       kube-prometheus-stack: 1Gi Prometheus limit, remote-write receiver on

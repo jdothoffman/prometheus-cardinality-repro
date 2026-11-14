@@ -215,42 +215,64 @@ static class Transactions
     }
 }
 
-sealed record LabelConfig(string[]? Labels = null, int? ResponseTimeDecimals = null);
+sealed record LabelConfig(string[]? Labels = null, int? ResponseTimeDecimals = null, int? ExtraLabels = null, int? ExtraPoolSize = null);
 
 // Which labels http_transactions_total carries, switchable at runtime. Removing a label only affects new
 // measurements: series the SDK already created stay in memory (cumulative) until the process restarts.
+//
+// Extra GUID labels (0-5): request_id, trace_id, session_id, correlation_id, tenant_id, the kind of labels
+// observability tooling appends. Values are random GUIDs, either unique per request (ExtraPoolSize = 0) or
+// drawn from a pool of N GUIDs per label. They add ~40 bytes per label to every series, so they grow the
+// export payload (and its serialization cost) as well as the series count. Changing them regenerates the GUIDs.
 sealed class LabelSet
 {
     public static readonly string[] All = ["consume_type", "state", "product", "pod", "response_time"];
     public static readonly string[] Bounded = ["consume_type", "state", "product", "pod"];
+    public static readonly string[] ExtraNames = ["request_id", "trace_id", "session_id", "correlation_id", "tenant_id"];
+    public const int MaxPool = 50_000;
 
-    private volatile string[] _enabled;
-    private volatile int _rtDecimals = 6;
+    private sealed record State(string[] Enabled, int RtDecimals, int ExtraCount, int ExtraPool, string[][] Pools);
+    private volatile State _s;
 
-    public LabelSet(string initialMode) => _enabled = ModeLabels(initialMode);
+    public LabelSet(string initialMode) => _s = new State(ModeLabels(initialMode), 6, 0, 0, []);
 
-    public string[] Enabled => _enabled;
-    public int ResponseTimeDecimals => _rtDecimals;
-    public bool Has(string label) => Array.IndexOf(_enabled, label) >= 0;
-    public bool IsUnbounded => Has("response_time");
-    public string Mode => IsUnbounded ? "unbounded" : "bounded";
-    public string Key => string.Join(",", _enabled) + (IsUnbounded ? $"@{_rtDecimals}" : "");
+    public string[] Enabled => _s.Enabled;
+    public int ResponseTimeDecimals => _s.RtDecimals;
+    public int ExtraLabels => _s.ExtraCount;
+    public int ExtraPoolSize => _s.ExtraPool;
+    public bool Has(string label) => Array.IndexOf(_s.Enabled, label) >= 0;
+    public bool IsUnbounded => Has("response_time") || (_s.ExtraCount > 0 && (_s.ExtraPool == 0 || _s.ExtraPool > 1000));
+    public string Mode => Has("response_time") ? "unbounded" : "bounded";
+    public string Key => KeyOf(_s.Enabled, _s.RtDecimals, _s.ExtraCount, _s.ExtraPool);
 
-    public string Describe() => string.Join(", ", _enabled.Select(l => l == "response_time" ? $"response_time({_rtDecimals}dp)" : l));
+    public static string KeyOf(string[] enabled, int rtDecimals, int extra, int pool) =>
+        string.Join(",", enabled) + (enabled.Contains("response_time") ? $"@{rtDecimals}" : "") + (extra > 0 ? $"+{extra}x{pool}" : "");
 
-    public LabelConfig ToConfig() => new(_enabled, _rtDecimals);
-
-    public void SetMode(string mode)
+    public string Describe()
     {
-        _rtDecimals = 6;
-        _enabled = ModeLabels(mode);
+        var s = _s;
+        var d = string.Join(", ", s.Enabled.Select(l => l == "response_time" ? $"response_time({s.RtDecimals}dp)" : l));
+        return s.ExtraCount > 0 ? $"{d}, +{s.ExtraCount} GUID labels ({(s.ExtraPool == 0 ? "unique" : $"pool {s.ExtraPool:N0}")})" : d;
     }
+
+    public LabelConfig ToConfig() { var s = _s; return new(s.Enabled, s.RtDecimals, s.ExtraCount, s.ExtraPool); }
+
+    public void SetMode(string mode) => _s = new State(ModeLabels(mode), 6, 0, 0, []);
 
     public void Set(LabelConfig c)
     {
-        if (c.ResponseTimeDecimals is { } d) _rtDecimals = Math.Clamp(d, 0, 6);
-        if (c.Labels is { } labels) _enabled = All.Where(l => labels.Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray();
+        var cur = _s;
+        var enabled = c.Labels is { } labels ? All.Where(l => labels.Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray() : cur.Enabled;
+        var rt = c.ResponseTimeDecimals is { } d ? Math.Clamp(d, 0, 6) : cur.RtDecimals;
+        var n = c.ExtraLabels is { } x ? Math.Clamp(x, 0, ExtraNames.Length) : cur.ExtraCount;
+        var k = c.ExtraPoolSize is { } y ? Math.Clamp(y, 0, MaxPool) : cur.ExtraPool;
+        var pools = n == cur.ExtraCount && k == cur.ExtraPool && c.ExtraLabels is null ? cur.Pools
+            : Enumerable.Range(0, n).Select(_ => Enumerable.Range(0, k).Select(_ => Guid.NewGuid().ToString()).ToArray()).ToArray();
+        _s = new State(enabled, rt, n, k, pools);
     }
+
+    // Snapshot used by one Record call, so a concurrent change can't produce a half-applied label set.
+    public (string[] Enabled, int RtDecimals, int ExtraCount, string[][] Pools) Current() { var s = _s; return (s.Enabled, s.RtDecimals, s.ExtraCount, s.Pools); }
 
     private static string[] ModeLabels(string mode) =>
         string.Equals(mode?.Trim(), "unbounded", StringComparison.OrdinalIgnoreCase) ? All : Bounded;
@@ -337,18 +359,22 @@ sealed class TransactionMetrics
         _duration.Record(elapsed.TotalSeconds,
             new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } });
 
-        var l = _labels;
+        var (enabled, rtDecimals, extra, pools) = _labels.Current();
+        bool Has(string l) => Array.IndexOf(enabled, l) >= 0;
         var tags = new TagList();
-        if (l.Has("consume_type")) tags.Add("consume_type", consumeType);
-        if (l.Has("state")) tags.Add("state", state);
-        if (l.Has("product")) tags.Add("product", product);
-        if (l.Has("pod")) tags.Add("pod", _pods.Pick());
+        if (Has("consume_type")) tags.Add("consume_type", consumeType);
+        if (Has("state")) tags.Add("state", state);
+        if (Has("product")) tags.Add("product", product);
+        if (Has("pod")) tags.Add("pod", _pods.Pick());
         // THE BUG: response time as a float LABEL. At 6 decimals nearly every request creates a new series;
         // lowering the precision buckets it (3 dp ≈ 1ms buckets, 2 dp ≈ 10ms, 1 dp ≈ 100ms).
-        if (l.IsUnbounded)
+        if (Has("response_time"))
+            tags.Add("response_time", Math.Round(elapsed.TotalSeconds, rtDecimals).ToString("F" + rtDecimals, CultureInfo.InvariantCulture));
+        // Extra GUID labels: unique per request, or from a fixed pool per label.
+        for (var i = 0; i < extra; i++)
         {
-            var d = l.ResponseTimeDecimals;
-            tags.Add("response_time", Math.Round(elapsed.TotalSeconds, d).ToString("F" + d, CultureInfo.InvariantCulture));
+            var pool = pools[i];
+            tags.Add(LabelSet.ExtraNames[i], pool.Length == 0 ? Guid.NewGuid().ToString() : pool[Random.Shared.Next(pool.Length)]);
         }
         _transactions.Add(1, tags);
     }
@@ -513,6 +539,8 @@ sealed class ReplicaStats(LabelSet labels, VirtualPods pods, ExportStats export,
             Mode = labels.Mode,
             Labels = labels.Enabled,
             ResponseTimeDecimals = labels.ResponseTimeDecimals,
+            ExtraLabels = labels.ExtraLabels,
+            ExtraPoolSize = labels.ExtraPoolSize,
             LabelKey = labels.Key,
             SampledAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             UptimeSeconds = (Environment.TickCount64 - _startedMs) / 1000.0,
@@ -593,6 +621,8 @@ sealed class ReplicaSnapshot
     public string Mode { get; set; } = "";
     public string[] Labels { get; set; } = [];
     public int ResponseTimeDecimals { get; set; }
+    public int ExtraLabels { get; set; }
+    public int ExtraPoolSize { get; set; }
     public string LabelKey { get; set; } = "";
     public long SampledAtUnixMs { get; set; }
     public double UptimeSeconds { get; set; }

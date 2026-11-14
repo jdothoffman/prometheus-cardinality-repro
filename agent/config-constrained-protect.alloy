@@ -1,0 +1,68 @@
+// Variant of config-constrained.alloy with Prometheus protected (make agent-constrained PROTECT_PROM=1).
+// Grafana Alloy agent, CONSTRAINED profile (`make agent-constrained`): same pipeline as config.alloy,
+// but Alloy runs with a small CPU/memory budget (agent/values-constrained.yaml) and a memory_limiter.
+// Under load it processes slowly and refuses data when memory is tight (HTTP 503 to the app's exporter),
+// so the app retries and holds payloads longer: back pressure from the metrics pipeline onto the app.
+// Unlike config-guarded.alloy it drops nothing: the point is to apply pressure, not to filter.
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+otelcol.receiver.otlp "default" {
+  http {
+    endpoint              = "0.0.0.0:4318"
+    max_request_body_size = "64MiB"
+  }
+  grpc {
+    endpoint          = "0.0.0.0:4317"
+    max_recv_msg_size = "64MiB"
+  }
+  output {
+    metrics = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+otelcol.processor.memory_limiter "default" {
+  check_interval         = "1s"
+  limit_percentage       = 70
+  spike_limit_percentage = 20
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  timeout             = "10s"
+  send_batch_size     = 8192
+  send_batch_max_size = 16384
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.relabel.protect_prometheus.receiver]
+}
+
+// PROTECT PROMETHEUS: drop series that carry response_time or extra GUID labels before they reach Prometheus. Everything up
+// to here is unchanged (the app still exports every series and Alloy still receives and converts them),
+// so the app -> agent back pressure under test is the same; Prometheus just doesn't store the explosion,
+// which keeps it (and Grafana) up during the run.
+prometheus.relabel "protect_prometheus" {
+  rule {
+    source_labels = ["response_time", "request_id", "trace_id", "session_id", "correlation_id", "tenant_id"]
+    separator     = ""
+    regex         = ".+"
+    action        = "drop"
+  }
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+
+prometheus.remote_write "prometheus" {
+  endpoint {
+    url = "http://kps-prometheus.monitoring.svc:9090/api/v1/write"
+  }
+}

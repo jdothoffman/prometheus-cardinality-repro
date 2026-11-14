@@ -238,6 +238,59 @@ sealed class KubeClient
             throw new InvalidOperationException($"rollout restart failed: HTTP {(int)resp.StatusCode} {await resp.Content.ReadAsStringAsync()}");
     }
 
+    public async Task DeletePodAsync(string ns, string pod)
+    {
+        using var req = Req($"/api/v1/namespaces/{ns}/pods/{pod}");
+        req.Method = HttpMethod.Delete;
+        using var resp = await _http!.SendAsync(req);
+        if (!resp.IsSuccessStatusCode && resp.StatusCode != System.Net.HttpStatusCode.NotFound)
+            throw new InvalidOperationException($"delete pod {ns}/{pod} failed: HTTP {(int)resp.StatusCode} {await resp.Content.ReadAsStringAsync()}");
+    }
+
+    // Waits until a Deployment's rollout is complete (all replicas updated and available).
+    public async Task WaitDeploymentReadyAsync(string ns, string name, TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            var d = await GetJsonAsync($"/apis/apps/v1/namespaces/{ns}/deployments/{name}");
+            var gen = d.GetProperty("metadata").GetProperty("generation").GetInt64();
+            var spec = d.GetProperty("spec").GetProperty("replicas").GetInt32();
+            var st = d.GetProperty("status");
+            int I(string k) => st.TryGetProperty(k, out var v) ? v.GetInt32() : 0;
+            var observed = st.TryGetProperty("observedGeneration", out var og) ? og.GetInt64() : 0;
+            // Same logic as `kubectl rollout status`: the new ReplicaSet is fully rolled out and no old pods remain.
+            var rolledOut = st.TryGetProperty("conditions", out var conds) && conds.EnumerateArray().Any(c =>
+                c.GetProperty("type").GetString() == "Progressing" && c.GetProperty("reason").GetString() == "NewReplicaSetAvailable");
+            if (observed >= gen && rolledOut && I("updatedReplicas") == spec && I("availableReplicas") == spec && I("replicas") == spec
+                && I("unavailableReplicas") == 0) return;
+            await Task.Delay(2000, ct);
+        }
+        throw new TimeoutException($"{ns}/{name} did not become ready within {timeout.TotalSeconds:N0}s");
+    }
+
+    // Waits until a pod exists, is newer than `after`, and is Ready.
+    public async Task WaitPodReadyAsync(string ns, string pod, DateTimeOffset after, TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var p = await GetJsonAsync($"/api/v1/namespaces/{ns}/pods/{pod}");
+                var created = DateTimeOffset.Parse(p.GetProperty("metadata").GetProperty("creationTimestamp").GetString()!, CultureInfo.InvariantCulture);
+                var ready = p.GetProperty("status").TryGetProperty("conditions", out var conds)
+                    && conds.EnumerateArray().Any(c => c.GetProperty("type").GetString() == "Ready" && c.GetProperty("status").GetString() == "True");
+                if (created > after.AddSeconds(-1) && ready) return;
+            }
+            catch (HttpRequestException) { /* pod not recreated yet */ }
+            await Task.Delay(2000, ct);
+        }
+        throw new TimeoutException($"{ns}/{pod} did not become ready within {timeout.TotalSeconds:N0}s");
+    }
+
     public async Task<string?> GetTextAsync(string path)
     {
         using var resp = await _http!.SendAsync(Req(path));
@@ -283,7 +336,9 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
     private static void AddExportEvidence(Evidence ev, RunRecord r, IReadOnlyList<ReplicaView> replicas)
     {
         var t0 = r.StartedAtUnix;
-        var during = r.ReplicaSamples.Where(s => s.Ts >= t0 && s.Ts <= r.EndedAtUnix).ToList();
+        // Traffic window only: EndedAtUnix also covers draining and the wait before the report is built.
+        var trafficEnd = t0 + (r.Points.Count == 0 ? 0 : r.Points.Max(p => p.T));
+        var during = r.ReplicaSamples.Where(s => s.Ts >= t0 && s.Ts <= trafficEnd).ToList();
         var interval = replicas.Select(v => v.Stats?.ExportIntervalMs ?? 0).FirstOrDefault(v => v > 0);
         var timeout = replicas.Select(v => v.Stats?.ExportTimeoutMs ?? 0).FirstOrDefault(v => v > 0);
         if (interval == 0) interval = 10_000;
@@ -327,7 +382,7 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
         ev.Facts["throttleAvgPct"] = thr.Count == 0 ? null : Math.Round(thr.Average(), 1);
 
         // Early vs late export cost (first vs last quarter of the run), to show growth.
-        var dur = Math.Max(1, r.EndedAtUnix - t0);
+        var dur = Math.Max(1, trafficEnd - t0);
         double? Q(long from, long to) { var v = during.Where(s => s.Ts - t0 >= from && s.Ts - t0 < to && s.ExportMaxMs.HasValue).Select(s => s.ExportMaxMs!.Value).ToList(); return v.Count == 0 ? null : v.Average(); }
         ev.Facts["exportEarlyMs"] = Q(0, dur / 4);
         ev.Facts["exportLateMs"] = Q(dur * 3 / 4, dur + 1);
@@ -344,6 +399,56 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
             xs.Add(e); ys.Add(pts.Max(p => p.P95));
         }
         ev.Facts["exportLatencyCorrelation"] = Pearson(xs, ys);
+
+        // ---- Load model: how much CPU do requests alone cost? ----
+        // Total CPU across replicas per poll vs the achieved request rate, from the early part of the run
+        // (low cardinality, no failures). Projected to the rate where the run degraded, this tells whether
+        // request work alone would have hit the CPU limit (load saturation) regardless of metrics.
+        var expected = replicas.Count(v => v.Stats is not null);
+        var cpuLimitTotal = replicas.Where(v => v.Stats?.CpuLimitCores is not null).Sum(v => v.Stats!.CpuLimitCores!.Value);
+        double OkRate(long t) { var w = r.Points.Where(p => p.T > t - 3 && p.T <= t).ToList(); return w.Count == 0 ? 0 : w.Average(p => p.Ok); }
+        double FailRate(long t) => r.Points.Where(p => p.T > t - 3 && p.T <= t).Sum(p => p.Timeouts + p.HttpErrors + p.ConnErrors + p.Dropped);
+        var cpuByT = during.GroupBy(s => s.Ts - t0)
+            .Where(g => g.Count(s => s.Reachable && s.CpuCores.HasValue) >= Math.Max(1, expected))
+            .Select(g => (T: g.Key, Cpu: g.Where(s => s.Reachable).Sum(s => s.CpuCores ?? 0), Thr: g.Where(s => s.Reachable).Max(s => s.ThrottledPct ?? 0),
+                          Exp: g.Max(s => s.ExportMaxMs ?? 0)))
+            .OrderBy(x => x.T).ToList();
+        var early = cpuByT.Where(x => x.T >= 10 && x.T <= dur * 0.4 && FailRate(x.T) == 0 && OkRate(x.T) > 0).ToList();
+        double? cpuPerReq = early.Count >= 3 ? early.Sum(x => x.Cpu) / early.Sum(x => OkRate(x.T)) : null;
+        ev.Facts["cpuLimitTotal"] = cpuLimitTotal > 0 ? cpuLimitTotal : null;
+        ev.Facts["cpuPerRequestMs"] = cpuPerReq * 1000;
+        if (cpuPerReq is { } cpr && cpuLimitTotal > 0)
+        {
+            ev.Facts["capacityEstimateRps"] = Math.Round(cpuLimitTotal / cpr);
+            var degr = r.Milestones.GetValueOrDefault("degraded") ?? r.Milestones.GetValueOrDefault("firstTimeout");
+            if (degr is not null) ev.Facts["projectedCpuAtDegradation"] = Math.Round(cpr * degr.Rate, 2);
+        }
+
+        // ---- When did export pressure start? (first poll with export >= 25% of timeout, or any failure/retry) ----
+        var onset = during.Where(s => (s.ExportMaxMs ?? 0) >= 0.25 * timeout || s.ExportFailures + s.ExportRetries > 0)
+            .Select(s => (long?)(s.Ts - t0)).Min();
+        ev.Facts["exportPressureOnsetT"] = onset;
+
+        // ---- Soak (constant rate): early vs late, the cleanest evidence at fixed load ----
+        if (r.Config.StartRate == r.Config.MaxRate)
+        {
+            ev.Facts["isSoak"] = 1;
+            var warm = Math.Min(60, dur / 10);
+            var e = cpuByT.Where(x => x.T >= warm && x.T < warm + (dur - warm) / 4).ToList();
+            var l = cpuByT.Where(x => x.T >= dur - (dur - warm) / 4).ToList();
+            var pe = r.Points.Where(p => p.T >= warm && p.T < warm + (dur - warm) / 4 && p.Ok > 0).ToList();
+            var pl = r.Points.Where(p => p.T >= dur - (dur - warm) / 4 && p.Ok > 0).ToList();
+            static double? Avg(IEnumerable<double> v) { var a = v.ToList(); return a.Count == 0 ? null : Math.Round(a.Average(), 2); }
+            ev.Facts["soakCpuEarly"] = Avg(e.Select(x => x.Cpu));
+            ev.Facts["soakCpuLate"] = Avg(l.Select(x => x.Cpu));
+            ev.Facts["soakThrottleEarly"] = Avg(e.Select(x => x.Thr));
+            ev.Facts["soakThrottleLate"] = Avg(l.Select(x => x.Thr));
+            ev.Facts["soakExportEarly"] = Avg(e.Select(x => x.Exp));
+            ev.Facts["soakExportLate"] = Avg(l.Select(x => x.Exp));
+            ev.Facts["soakP95Early"] = Avg(pe.Select(p => p.P95));
+            ev.Facts["soakP95Late"] = Avg(pl.Select(p => p.P95));
+            ev.Facts["soakFailuresLate"] = r.Points.Where(p => p.T >= dur / 2).Sum(p => p.Timeouts + p.HttpErrors + p.ConnErrors + p.Dropped);
+        }
     }
 
     private static double? Pearson(List<double> x, List<double> y)
@@ -681,27 +786,78 @@ static class Analyzer
             var corr = fx.GetValueOrDefault("exportLatencyCorrelation");
             var early = fx.GetValueOrDefault("exportEarlyMs");
             var late = fx.GetValueOrDefault("exportLateMs");
-            var degraded = ms.GetValueOrDefault("degraded") is not null || ms.GetValueOrDefault("firstTimeout") is not null;
+            var onsetT = fx.GetValueOrDefault("exportPressureOnsetT");
+            var cpuLimit = fx.GetValueOrDefault("cpuLimitTotal");
+            var projected = fx.GetValueOrDefault("projectedCpuAtDegradation");
+            var capacity = fx.GetValueOrDefault("capacityEstimateRps");
+            var degrMs = ms.GetValueOrDefault("degraded") ?? ms.GetValueOrDefault("firstTimeout");
+            var degraded = degrMs is not null;
+            var isSoak = fx.GetValueOrDefault("isSoak") == 1;
+            static string N(double? v, string fmt = "N0") => v?.ToString(fmt, CultureInfo.InvariantCulture) ?? "?";
 
             var pressure = exportMax >= 0.5 * timeoutMs || retries > 0;
             var contention = throttlePeak >= 25 || pinned.Count > 0;
             var linked = corr >= 0.3;
             var masked = nearLimitAtStart.Count > 0 || appTerms.Any(t => t.Reason == "OOMKilled") && !pressure;
 
-            var evidence =
-                $"Export duration peaked at {exportMax?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"} ms (timeout {timeoutMs:N0} ms; first quarter avg {early?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"} ms → last quarter {late?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"} ms), " +
-                $"{retries:N0} export failures/retries, payload up to {fx.GetValueOrDefault("exportPointsPeak") ?? 0:N0} points. " +
-                $"Pod CPU throttling peaked at {throttlePeak?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"}%. " +
-                $"Correlation between export cost and client p95: r = {corr?.ToString("N2", CultureInfo.InvariantCulture) ?? "n/a"}. " +
-                $"Agent profile: {r.AgentProfile}.";
+            // Load saturation: would request work alone have reached the CPU limit where it degraded?
+            var loadSaturated = degrMs is not null && projected is not null && cpuLimit is not null && projected >= 0.9 * cpuLimit;
+            if (fx.GetValueOrDefault("cpuPerRequestMs") is { } cprMs)
+                f.Add(new(loadSaturated ? "critical" : "info",
+                    loadSaturated ? $"Load saturation: request CPU alone reaches the limit at ≈{N(capacity)} req/s" : $"Request-only capacity ≈ {N(capacity)} req/s",
+                    $"Requests cost ≈{cprMs:N2} ms of CPU each (measured early in the run, at low cardinality); {N(cpuLimit, "N1")} cores in total across replicas ⇒ ≈{N(capacity)} req/s before any metrics overhead. " +
+                    (degrMs is null ? "The run did not degrade."
+                        : $"At the degradation point ({degrMs.Rate:N0} req/s) requests alone would use ≈{N(projected, "N2")} cores " +
+                          (loadSaturated ? "— at or above the limit, so the degradation is explained by load, not by metrics."
+                                         : "— below the limit, so something else (e.g. export cost) used the remaining CPU."))));
 
-            if (degraded && pressure && contention && !masked)
+            // Ordering: export pressure must start before (or with) the degradation to be a cause.
+            var precedes = onsetT is not null && (degrMs is null || onsetT <= degrMs.T + 10);
+
+            var evidence =
+                $"Export duration peaked at {N(exportMax)} ms (timeout {timeoutMs:N0} ms; first quarter avg {N(early)} ms → last quarter {N(late)} ms), " +
+                $"{retries:N0} export failures/retries, payload up to {fx.GetValueOrDefault("exportPointsPeak") ?? 0:N0} points. " +
+                $"Export pressure began at {(onsetT is null ? "—" : $"t={onsetT:N0}s")}; degradation at {(degrMs is null ? "—" : $"t={degrMs.T}s ({degrMs.Rate:N0} req/s)")}. " +
+                $"Pod CPU throttling peaked at {N(throttlePeak)}%. Export-cost ↔ p95 correlation r = {N(corr, "N2")}. Agent: {r.AgentProfile}.";
+
+            if (isSoak)
+            {
+                // At constant load the only thing that changes over time is cardinality / export cost.
+                var cpuE = fx.GetValueOrDefault("soakCpuEarly"); var cpuL = fx.GetValueOrDefault("soakCpuLate");
+                var p95E = fx.GetValueOrDefault("soakP95Early"); var p95L = fx.GetValueOrDefault("soakP95Late");
+                var thrE = fx.GetValueOrDefault("soakThrottleEarly"); var thrL = fx.GetValueOrDefault("soakThrottleLate");
+                var expE = fx.GetValueOrDefault("soakExportEarly"); var expL = fx.GetValueOrDefault("soakExportLate");
+                var failLate = fx.GetValueOrDefault("soakFailuresLate") ?? 0;
+                var latencyRose = p95L >= Math.Max(2 * (p95E ?? 0), (p95E ?? 0) + 100) || failLate > 0;
+                var cpuRose = cpuL >= 1.15 * cpuE || thrL >= 25 && thrL >= 2 * (thrE ?? 0) + 5;
+                var exportRose = expL >= Math.Max(10 * (expE ?? 0), 500) || retries > 0;
+                var earlySaturated = cpuE is not null && cpuLimit is not null && cpuE >= 0.85 * cpuLimit;
+                var soakEvidence = $"Constant {r.Config.StartRate:N0} req/s. Early → late: CPU {N(cpuE, "N2")} → {N(cpuL, "N2")} cores, " +
+                    $"throttling {N(thrE)}% → {N(thrL)}%, export {N(expE)} → {N(expL)} ms, p95 {N(p95E)} → {N(p95L)} ms, {failLate:N0} failures in the second half. ";
+                f.Add(new("info", "Soak: early vs late at constant load", soakEvidence));
+
+                if (latencyRose && exportRose && cpuRose && !earlySaturated && !masked)
+                    f.Add(new("critical", "Metrics back pressure: CONFIRMED — at constant load, growing export cost took CPU from request handling",
+                        soakEvidence + evidence));
+                else if (exportRose && (cpuRose || latencyRose))
+                    f.Add(new("warn", "Metrics back pressure: PARTIAL",
+                        soakEvidence + (!latencyRose ? "Latency did not rise enough to call it degradation. " : "") + (!cpuRose ? "CPU did not grow. " : "")
+                        + (earlySaturated ? "CPU was already near the limit early on (load, not metrics). " : "") + evidence + " Next: a higher level (more load or longer) or the constrained agent."));
+                else
+                    f.Add(new("info", "Metrics back pressure: NOT CONFIRMED",
+                        soakEvidence + (!exportRose ? "Export cost did not grow enough to matter. " : "Export cost grew but did not affect the app. ") + evidence));
+            }
+            else if (degraded && pressure && contention && precedes && !loadSaturated && !masked)
                 f.Add(new("critical", "Metrics back pressure: CONFIRMED — export cost competed with request handling",
-                    evidence + (linked ? " Latency rose with export cost." : " (Latency/export correlation is weak; compare against the same ramp with the normal agent.)")));
+                    evidence + (linked ? " Latency rose with export cost." : " (Latency/export correlation is weak; confirm with a soak test.)")));
             else if (pressure && (contention || degraded))
                 f.Add(new("warn", "Metrics back pressure: PARTIAL",
-                    evidence + (masked ? " A different failure (GC heap pre-allocation or a container OOMKill) also occurred, so the export path is not the only cause." : "")
-                             + (!degraded ? " The app did not degrade." : "") + (!contention ? " No significant CPU contention in the pods." : "")));
+                    evidence
+                    + (loadSaturated ? " The degradation is explained by request load reaching the CPU limit." : "")
+                    + (!precedes && degrMs is not null ? " Export pressure started only after the app had already degraded: exports were a casualty, not the cause." : "")
+                    + (masked ? " A different failure (GC heap pre-allocation or a container OOMKill) also occurred." : "")
+                    + (!degraded ? " The app did not degrade." : "") + (!contention ? " No significant CPU contention in the pods." : "")
+                    + " A ramp couples load and cardinality; use a soak (Hypothesis tests panel) to separate them."));
             else
                 f.Add(new("info", "Metrics back pressure: NOT CONFIRMED",
                     evidence + (!pressure ? " Exports stayed well within their timeout with no retries, so the agent was not pushing back."
@@ -728,8 +884,11 @@ static class Analyzer
                     $"Prometheus peaked at {Mib(fx.GetValueOrDefault("promMemPeak"))} ({Pct(fx.GetValueOrDefault("promMemPeak"), fx.GetValueOrDefault("promMemLimit"))} of limit), " +
                     $"Alloy at {Mib(fx.GetValueOrDefault("alloyMemPeak"))} ({Pct(fx.GetValueOrDefault("alloyMemPeak"), fx.GetValueOrDefault("alloyMemLimit"))}). The app failed before the pipeline was stressed."));
             f.Add(new("info", "Cardinality reached",
-                $"Prometheus head series peaked at {fx.GetValueOrDefault("headSeriesPeak"):N0}; http_transactions_total at {fx.GetValueOrDefault("txSeriesPeak"):N0} series, " +
-                $"{fx.GetValueOrDefault("rtSeriesPeak") ?? 0:N0} of them carrying a response_time label."));
+                $"Prometheus head series peaked at {fx.GetValueOrDefault("headSeriesPeak"):N0}. " +
+                (fx.GetValueOrDefault("txSeriesPeak") is { } txs
+                    ? $"http_transactions_total: {txs:N0} series in Prometheus, {fx.GetValueOrDefault("rtSeriesPeak") ?? 0:N0} with a response_time label. "
+                    : "http_transactions_total was not stored in Prometheus (Alloy's PROTECT_PROM drop rule removes high-cardinality series). ") +
+                $"The app exported up to {fx.GetValueOrDefault("exportPointsPeak") ?? 0:N0} points per replica per export."));
         }
         else
             f.Add(new("warn", "Prometheus unavailable when the report was generated", ev.PrometheusError ?? "unknown error"));
@@ -738,6 +897,7 @@ static class Analyzer
         var order = new[] { "critical", "warn", "info", "ok" };
         f = f.OrderBy(x => Array.IndexOf(order, x.Severity)).ToList();
         var headline = f.FirstOrDefault(x => x.Title.StartsWith("Metrics back pressure: CONFIRMED", StringComparison.Ordinal))?.Title
+                       ?? f.FirstOrDefault(x => x.Title.StartsWith("Load saturation", StringComparison.Ordinal))?.Title
                        ?? f.FirstOrDefault(x => x.Severity == "critical" && x.Title.Contains(".NET", StringComparison.Ordinal))?.Title
                        ?? f.FirstOrDefault(x => x.Severity == "critical")?.Title
                        ?? f.FirstOrDefault(x => x.Severity == "warn")?.Title

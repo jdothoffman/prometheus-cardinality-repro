@@ -112,6 +112,21 @@
   label.chk.bad { grid-column: 1 / -1; color: var(--bad); }
   label.chk select { margin-left: auto; padding: 2px 4px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--ink); font: inherit; font-size: 12px; }
   code { font-family: var(--mono); font-size: 12px; }
+  .extras { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 2px 0 4px; }
+  .hyp { margin-top: 14px; }
+  .hypgrid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 18px; }
+  @media (max-width: 900px) { .hypgrid { grid-template-columns: 1fr; } }
+  .levels { display: grid; gap: 6px; margin-top: 8px; }
+  .lvl { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 10px; align-items: center; text-align: left; padding: 8px 10px;
+         border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; cursor: pointer; }
+  .lvl.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .lvl b { font-size: 15px; }
+  .lvl .d { color: var(--muted); font-size: 12px; }
+  .lvl .a { font-size: 11px; }
+  .agentcheck { margin: 10px 0 4px; font-size: 13px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); }
+  .agentcheck.ok { border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+  .agentcheck.bad { border-color: color-mix(in srgb, var(--bad) 60%, transparent); }
+  .agentcheck code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -143,6 +158,18 @@
           <select id="rtDecimals" title="response_time precision">
             <option value="6">6 dp ≈ unique</option><option value="3">3 dp ≈ 1 ms</option>
             <option value="2">2 dp ≈ 10 ms</option><option value="1">1 dp ≈ 100 ms</option>
+          </select></label>
+      </div>
+      <div class="extras">
+        <label class="chk" style="margin:0">+ GUID labels
+          <select id="extraLabels" title="request_id, trace_id, session_id, correlation_id, tenant_id">
+            <option value="0">none</option><option value="1">1</option><option value="2">2</option>
+            <option value="3">3</option><option value="4">4</option><option value="5">5</option>
+          </select></label>
+        <label class="chk" style="margin:0">values
+          <select id="extraPool">
+            <option value="0">unique per request</option><option value="10">pool of 10</option>
+            <option value="100">pool of 100</option><option value="1000">pool of 1,000</option><option value="10000">pool of 10,000</option>
           </select></label>
       </div>
       <div class="actions" style="margin-top:6px">
@@ -190,6 +217,27 @@
       </div>
     </section>
   </div>
+
+  <section class="panel hyp">
+    <h2>Hypothesis tests: metrics back pressure vs the live app</h2>
+    <div class="hypgrid">
+      <div>
+        <label>Measured capacity (bounded) <span><input id="capacity" type="number" value="2350" min="50" step="50"> <span class="hint">req/s</span></span></label>
+        <div class="note">From the "Request-only capacity" finding in a report. Levels run a constant-rate soak at a % of this.</div>
+        <div class="levels" id="levels"></div>
+      </div>
+      <div>
+        <div id="levelInfo" class="kv"></div>
+        <div id="agentCheck" class="agentcheck"></div>
+        <div class="actions">
+          <button class="btn primary" id="runHyp">Run hypothesis</button>
+          <button class="btn" id="runCtl">Run control (bounded)</button>
+        </div>
+        <button class="btn" id="resetAll" style="width:100%;margin-top:8px">Reset everything (replicas, Alloy, Prometheus)</button>
+        <div class="note" style="margin-top:6px">Each run first resets everything, applies the labels, waits for one export cycle, then starts. Pass a level → move to the next.</div>
+      </div>
+    </div>
+  </section>
 
   <div class="grid charts">
     <section class="panel"><h2>Throughput</h2><div class="legend" id="lgRate"></div><svg class="chart" id="chRate"></svg></section>
@@ -280,11 +328,15 @@ function render(data) {
   const t = data.test, cfg = t.config, cur = t.current;
   $('stateText').textContent = t.state === 'running' ? `${t.name} · ${t.dryRun ? 'bounded' : t.mode}`
     : t.state === 'checking' ? 'dry run · checking pipeline'
-    : t.state === 'reporting' ? `${t.name} · collecting evidence for the report…` : t.state;
-  $('statePill').className = 'pill ' + (t.state === 'checking' || t.state === 'reporting' ? 'draining' : t.state);
+    : t.state === 'reporting' ? `${t.name} · collecting evidence for the report…`
+    : t.state === 'preparing' ? `resetting · ${t.prepStatus || '…'}` : t.state;
+  $('statePill').className = 'pill ' + (['checking', 'reporting', 'preparing'].includes(t.state) ? 'draining' : t.state);
+  if (t.prepError) $('err').textContent = t.prepError;
+  ['runHyp', 'runCtl', 'resetAll'].forEach(id => $(id).disabled = t.state !== 'idle');
+  $('stopBtn').textContent = t.state === 'preparing' ? 'Cancel reset' : 'Stop';
   $('startBtn').disabled = t.state !== 'idle';
   $('dryBtn').disabled = t.state !== 'idle';
-  $('stopBtn').disabled = t.state !== 'running';
+  $('stopBtn').disabled = !['running', 'preparing'].includes(t.state);
   const locked = t.dryRun && t.state !== 'idle';
   document.querySelectorAll('#modeSeg button').forEach(b => b.disabled = locked && b.dataset.mode === 'unbounded');
 
@@ -309,11 +361,15 @@ function render(data) {
   if (!labelsDirty) {
     document.querySelectorAll('#labelBoxes input').forEach(i => i.checked = curLabels.includes(i.value));
     $('rtDecimals').value = String(cur0.responseTimeDecimals ?? 6);
+    $('extraLabels').value = String(cur0.extraLabels ?? 0);
+    $('extraPool').value = String(cur0.extraPoolSize ?? 0);
   }
+  $('extraLabels').disabled = $('extraPool').disabled = locked;
+  renderHypothesis(data);
   document.querySelector('#labelBoxes input[value=response_time]').disabled = locked;
   $('restartReplicas').disabled = locked;
-  const isBoundedPreset = curLabels.join(',') === 'consume_type,state,product,pod';
-  const isUnboundedPreset = curLabels.length === 5 && (cur0.responseTimeDecimals ?? 6) === 6;
+  const isBoundedPreset = curLabels.join(',') === 'consume_type,state,product,pod' && !(cur0.extraLabels > 0);
+  const isUnboundedPreset = curLabels.length === 5 && (cur0.responseTimeDecimals ?? 6) === 6 && !(cur0.extraLabels > 0);
   document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on',
     b.dataset.mode === 'bounded' ? isBoundedPreset : isUnboundedPreset));
   $('modeNote').textContent = data.replicas.observed === 'mixed'
@@ -468,6 +524,77 @@ function renderHistory(h) {
     ${rows || '<tr><td colspan="11" style="text-align:left">No completed runs yet. Run once bounded, then once with the response_time label.</td></tr>'}`;
 }
 
+// ---------- hypothesis presets ----------
+// Constant-rate soaks: load stays fixed, so anything that gets worse over time comes from growing
+// cardinality / export cost. Pass a level (no back-pressure confirmation, app healthy) -> go to the next.
+const LEVELS = [
+  { n: 1, pct: 60, min: 10, extra: 0, agent: 'normal', what: 'response_time only' },
+  { n: 2, pct: 60, min: 10, extra: 3, agent: 'normal', what: '+3 unique GUID labels (bigger payloads)' },
+  { n: 3, pct: 70, min: 15, extra: 5, agent: 'normal', what: '+5 unique GUID labels, more load' },
+  { n: 4, pct: 70, min: 15, extra: 5, agent: 'constrained', what: 'constrained agent pushes back' },
+  { n: 5, pct: 80, min: 20, extra: 5, agent: 'constrained', what: 'max: 80% load, 20 min' },
+];
+let level = 1;
+try { level = Number(localStorage.getItem('hypLevel')) || 1; $('capacity').value = localStorage.getItem('hypCapacity') || $('capacity').value; } catch { }
+const lv = () => LEVELS.find(l => l.n === level) || LEVELS[0];
+const rateFor = (l) => Math.max(50, Math.round(Number($('capacity').value || 2350) * l.pct / 100 / 50) * 50);
+function renderLevels() {
+  $('levels').innerHTML = LEVELS.map(l => `<button class="lvl ${l.n === level ? 'on' : ''}" data-n="${l.n}">
+      <b>L${l.n}</b><span>${l.pct}% · ${fmtN(rateFor(l))} req/s · ${l.min} min<div class="d">${esc(l.what)}</div></span>
+      <span class="tag ${l.agent === 'constrained' ? 'warn' : 'ok'} a">${l.agent}</span></button>`).join('');
+  document.querySelectorAll('.lvl').forEach(b => b.onclick = () => { level = Number(b.dataset.n); try { localStorage.setItem('hypLevel', level); } catch { } renderLevels(); if (last) renderHypothesis(last); });
+}
+$('capacity').oninput = () => { try { localStorage.setItem('hypCapacity', $('capacity').value); } catch { } renderLevels(); if (last) renderHypothesis(last); };
+function hypLabels(l) { return { labels: ['consume_type', 'state', 'product', 'pod', 'response_time'], responseTimeDecimals: 6, extraLabels: l.extra, extraPoolSize: 0 }; }
+function ctlLabels() { return { labels: ['consume_type', 'state', 'product', 'pod'], responseTimeDecimals: 6, extraLabels: 0, extraPoolSize: 0 }; }
+function agentState(data) {
+  const al = (data && data.pipeline && data.pipeline.alloy) || {};
+  const need = lv().agent, okProfile = al.profile === need, okProtect = !!al.protectPrometheus;
+  return { ok: okProfile && okProtect, have: al.profile || 'unknown', protect: okProtect, need };
+}
+function renderHypothesis(data) {
+  const l = lv(), rate = rateFor(l), a = agentState(data);
+  $('levelInfo').innerHTML = `
+    <div>Level</div><div><b>L${l.n}</b>: ${esc(l.what)}</div>
+    <div>Load</div><div>constant ${fmtN(rate)} req/s (${l.pct}% of capacity) for ${l.min} min</div>
+    <div>Hypothesis labels</div><div>all 5 incl. response_time (6 dp)${l.extra ? ` + ${l.extra} unique GUID labels` : ''}</div>
+    <div>Control labels</div><div>bounded (consume_type, state, product, pod)</div>
+    <div>Timeout · auto-stop</div><div>3 s · 50% errors</div>`;
+  const box = $('agentCheck');
+  box.className = 'agentcheck ' + (a.ok ? 'ok' : 'bad');
+  box.innerHTML = a.ok
+    ? `✓ Agent: <b>${esc(a.have)}</b>, Prometheus protected. Ready for L${l.n}.`
+    : `✗ L${l.n} needs agent <b>${a.need}</b> with Prometheus protected (now: ${esc(a.have)}${a.protect ? ', protected' : ', not protected'}). Run:<br><code>make agent-${a.need} PROTECT_PROM=1</code>`;
+}
+function hypConfig(l, kind) {
+  const rate = rateFor(l);
+  return { startRate: rate, stepRate: 0, stepSeconds: l.min * 60, maxRate: rate, timeoutMs: 3000, degradedP95Ms: 1000, stopErrorPct: 50, maxInFlight: 6000,
+    name: `L${l.n} ${kind} · ${rate} req/s · ${l.min}m · ${l.agent} agent`,
+    notes: `Hypothesis level ${l.n} (${l.what}), ${kind} run: constant ${rate} req/s = ${l.pct}% of measured capacity ${$('capacity').value} req/s, ${l.min} min. ` +
+           (kind === 'hypothesis' ? `Labels: all incl. response_time(6dp)${l.extra ? ` + ${l.extra} unique GUID labels` : ''}.` : 'Labels: bounded.') };
+}
+async function runPrepared(kind) {
+  const l = lv(), a = agentState(last);
+  if (!a.ok && !confirm(`L${l.n} expects the ${a.need} agent with Prometheus protected (now: ${a.have}${a.protect ? ', protected' : ', not protected'}).\n\nRun "make agent-${a.need} PROTECT_PROM=1" first, or press OK to run anyway.`)) return;
+  const config = hypConfig(l, kind);
+  if (!confirm(`Reset everything and run:\n\n${config.name}\n\nThis restarts the app replicas, Alloy and Prometheus first (about 1–2 min).`)) return;
+  ['startRate', 'stepRate', 'stepSeconds', 'maxRate', 'timeoutMs', 'degradedP95Ms', 'stopErrorPct'].forEach(k => { if ($(k)) $(k).value = config[k]; });
+  $('testName').value = config.name; $('testNotes').value = config.notes;
+  const r = await fetch('/api/test/prepared', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config, labels: kind === 'hypothesis' ? hypLabels(l) : ctlLabels() }) });
+  if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not start';
+  labelsDirty = false; poll();
+}
+$('runHyp').onclick = () => runPrepared('hypothesis');
+$('runCtl').onclick = () => runPrepared('control');
+$('resetAll').onclick = async () => {
+  if (!confirm('Restart the app replicas and Alloy, and wipe Prometheus? Labels are reset to bounded.')) return;
+  const r = await fetch('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(ctlLabels()) });
+  if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not reset';
+  labelsDirty = false; poll();
+};
+renderLevels();
+
 // ---------- polling & actions ----------
 async function poll() {
   if (busy) return;
@@ -503,11 +630,12 @@ document.querySelectorAll('#modeSeg button').forEach(b => b.onclick = async () =
   labelsDirty = false;
   poll();
 });
-document.querySelectorAll('#labelBoxes input, #rtDecimals').forEach(i => i.onchange = () => { labelsDirty = true; });
+document.querySelectorAll('#labelBoxes input, #rtDecimals, #extraLabels, #extraPool').forEach(i => i.onchange = () => { labelsDirty = true; });
 $('applyLabels').onclick = async () => {
   const labels = [...document.querySelectorAll('#labelBoxes input')].filter(i => i.checked).map(i => i.value);
   const r = await fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ labels, responseTimeDecimals: Number($('rtDecimals').value) }) });
+    body: JSON.stringify({ labels, responseTimeDecimals: Number($('rtDecimals').value),
+      extraLabels: Number($('extraLabels').value), extraPoolSize: Number($('extraPool').value) }) });
   if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not change labels';
   labelsDirty = false;
   poll();

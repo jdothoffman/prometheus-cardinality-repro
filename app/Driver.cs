@@ -60,6 +60,14 @@ static class Driver
                 : Results.File(path, "text/html; charset=utf-8");
         });
 
+        // Hypothesis presets: reset everything, apply labels, then start the given test.
+        app.MapPost("/api/test/prepared", (PreparedRequest req, LoadTest test) =>
+            test.Prepare(req.Config, req.Labels) ? Results.Ok(new { preparing = true }) : Results.Conflict(new { error = "a test is already running or preparing" }));
+
+        // Reset everything without starting a test (labels default to the current ones).
+        app.MapPost("/api/reset", (LabelConfig? labels, LoadTest test, ReplicaMonitor replicas) =>
+            test.Prepare(null, labels ?? replicas.CurrentLabels) ? Results.Ok(new { preparing = true }) : Results.Conflict(new { error = "a test is already running or preparing" }));
+
         app.MapPost("/api/test/dryrun", (TestConfig config, LoadTest test) =>
             test.Start(DryRunPreset.Apply(config)) ? Results.Ok(new { started = true }) : Results.Conflict(new { error = "a test is already running" }));
 
@@ -76,8 +84,8 @@ static class Driver
         app.MapPost("/api/labels", async (LabelConfig config, ReplicaMonitor replicas, LoadTest test) =>
         {
             var c = Labels.Normalize(config);
-            if (test.DryRunActive && c.Labels!.Contains("response_time"))
-                return Results.Conflict(new { error = "response_time is locked off during a dry run" });
+            if (test.DryRunActive && Labels.IsHighCardinality(c))
+                return Results.Conflict(new { error = "response_time and GUID labels are locked off during a dry run" });
             var applied = await replicas.ApplyLabelsAsync(c);
             return Results.Ok(new { labels = c, description = Labels.Describe(c), applied });
         });
@@ -114,6 +122,8 @@ static class Driver
             }));
     }
 }
+
+sealed record PreparedRequest(TestConfig Config, LabelConfig Labels);
 
 sealed record TestConfig(
     int StartRate = 50,
@@ -159,6 +169,10 @@ sealed class LoadTest
     private readonly string _target;
     private readonly ReplicaMonitor _replicas;
     private readonly PipelineMonitor _pipeline;
+    private readonly KubeClient _kube;
+    private volatile string? _prepStatus;
+    private string? _prepError;
+    private CancellationTokenSource? _prepCts;
     private readonly ILogger<LoadTest> _log;
     private List<Check> _checks = [];
     private bool _checksForDryRun;
@@ -185,8 +199,9 @@ sealed class LoadTest
     private Milestone? _degraded, _firstTimeout, _errors5, _errors50;
 
     public LoadTest(IConfiguration cfg, ReplicaMonitor replicas, PipelineMonitor pipeline, RunStore store,
-        EvidenceCollector evidence, ILogger<LoadTest> log)
+        EvidenceCollector evidence, KubeClient kube, ILogger<LoadTest> log)
     {
+        _kube = kube;
         _replicas = replicas;
         _pipeline = pipeline;
         _store = store;
@@ -204,7 +219,7 @@ sealed class LoadTest
     }
 
     public long StartedAtUnix => _startedTs;
-    public bool DryRunActive => _state != "idle" && _config?.DryRun == true;
+    public bool DryRunActive => _state is not ("idle" or "preparing") && _config?.DryRun == true;
 
     public bool Start(TestConfig c)
     {
@@ -215,7 +230,7 @@ sealed class LoadTest
             {
                 StartRate = Math.Clamp(c.StartRate, 1, 20_000),
                 StepRate = Math.Clamp(c.StepRate, 0, 5_000),
-                StepSeconds = Math.Clamp(c.StepSeconds, 5, 600),
+                StepSeconds = Math.Clamp(c.StepSeconds, 5, 3600),
                 MaxRate = Math.Clamp(c.MaxRate, 1, 20_000),
                 TimeoutMs = Math.Clamp(c.TimeoutMs, 100, 60_000),
                 DegradedP95Ms = Math.Clamp(c.DegradedP95Ms, 10, 60_000),
@@ -233,14 +248,14 @@ sealed class LoadTest
             var current = _replicas.CurrentLabels;
             // A dry run keeps the chosen labels but never response_time, so it can't explode anything.
             _labelsAtStart = _config.DryRun
-                ? new LabelConfig(current.Labels!.Where(l => l != "response_time").ToArray(), current.ResponseTimeDecimals)
+                ? new LabelConfig(current.Labels!.Where(l => l != "response_time").ToArray(), current.ResponseTimeDecimals, 0, 0)
                 : current;
             _modeAtStart = Labels.Describe(_labelsAtStart);
             _agentProfile = _pipeline.AgentProfile;
             var name = (c.Name ?? "").Trim();
             _name = name.Length > 0 ? name[..Math.Min(80, name.Length)]
                 : _config.DryRun ? "Dry run"
-                : $"{(_labelsAtStart.Labels!.Contains("response_time") ? "response_time" : "bounded")} · {_agentProfile} agent · {_config.StartRate}→{_config.MaxRate} req/s";
+                : $"{(Labels.IsHighCardinality(_labelsAtStart) ? "high-cardinality" : "bounded")} · {_agentProfile} agent · {_config.StartRate}→{_config.MaxRate} req/s";
             _notes = string.IsNullOrWhiteSpace(c.Notes) ? null : c.Notes.Trim()[..Math.Min(2000, c.Notes.Trim().Length)];
             _state = "running";
             _cts = new CancellationTokenSource();
@@ -256,10 +271,85 @@ sealed class LoadTest
     {
         lock (_lock)
         {
+            if (_state == "preparing") { _prepCts?.Cancel(); return; }
             if (_state != "running") return;
             _stopReason ??= reason;
             _cts?.Cancel();
         }
+    }
+
+    // "Reset everything" and, optionally, start a test afterwards: restart the app replicas (clears SDK
+    // series), restart Alloy (clears its WAL/series cache), delete the Prometheus pod (wipes the TSDB),
+    // wait for all three, apply the requested labels, let one export cycle pass, then start.
+    public bool Prepare(TestConfig? then, LabelConfig labels)
+    {
+        lock (_lock)
+        {
+            if (_state != "idle") return false;
+            _state = "preparing";
+            _prepError = null;
+            _prepStatus = "Starting…";
+            _prepCts = new CancellationTokenSource();
+            var ct = _prepCts.Token;
+            _ = Task.Run(() => PrepareAsync(then, Labels.Normalize(labels), ct));
+            return true;
+        }
+    }
+
+    private async Task PrepareAsync(TestConfig? then, LabelConfig labels, CancellationToken ct)
+    {
+        try
+        {
+            if (!_kube.Available) throw new InvalidOperationException("Kubernetes API not available to the driver");
+            var started = DateTimeOffset.UtcNow;
+            _replicas.DesiredLabels = labels; // restarted replicas pick these up from the reconciler
+            _prepStatus = "Restarting app replicas, Alloy and Prometheus…";
+            await _kube.RolloutRestartAsync("demo", "transactions-api");
+            await _kube.RolloutRestartAsync("alloy", "alloy");
+            await _kube.DeletePodAsync("monitoring", "prometheus-kps-prometheus-0");
+            await Task.Delay(3000, ct);
+
+            _prepStatus = "Waiting for app replicas…";
+            await _kube.WaitDeploymentReadyAsync("demo", "transactions-api", TimeSpan.FromMinutes(4), ct);
+            _prepStatus = "Waiting for Alloy…";
+            await _kube.WaitDeploymentReadyAsync("alloy", "alloy", TimeSpan.FromMinutes(3), ct);
+            _prepStatus = "Waiting for Prometheus…";
+            await _kube.WaitPodReadyAsync("monitoring", "prometheus-kps-prometheus-0", started, TimeSpan.FromMinutes(4), ct);
+
+            _prepStatus = "Applying labels to the new replicas…";
+            var dep = await _kube.GetJsonAsync("/apis/apps/v1/namespaces/demo/deployments/transactions-api");
+            var expected = dep.GetProperty("spec").GetProperty("replicas").GetInt32();
+            var key = Labels.Key(labels);
+            var deadline = DateTime.UtcNow.AddMinutes(2);
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                var age = (DateTimeOffset.UtcNow - started).TotalSeconds;
+                var fresh = _replicas.Latest.Where(v => v.Reachable && v.Stats is not null && v.Stats.UptimeSeconds < age + 5).ToList();
+                if (fresh.Count >= expected && fresh.All(v => v.Stats!.LabelKey == key)) break;
+                if (DateTime.UtcNow > deadline) throw new TimeoutException($"only {fresh.Count}/{expected} fresh replicas with the requested labels");
+                await _replicas.ApplyLabelsAsync(labels);
+                await Task.Delay(2000, ct);
+            }
+
+            _prepStatus = "Settling (one export cycle)…";
+            await Task.Delay(15_000, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            lock (_lock) { _prepError = "Preparation cancelled"; _prepStatus = null; _state = "idle"; }
+            return;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Preparation failed");
+            lock (_lock) { _prepError = "Preparation failed: " + ex.Message; _prepStatus = null; _state = "idle"; }
+            return;
+        }
+
+        lock (_lock) { _prepStatus = null; _state = "idle"; }
+        _log.LogInformation("Reset complete{Then}", then is null ? "" : "; starting test");
+        if (then is not null && !Start(then)) lock (_lock) _prepError = "Reset complete, but the test could not start";
     }
 
     private async Task RunAsync(TestConfig cfg, CancellationToken ct)
@@ -402,7 +492,7 @@ sealed class LoadTest
         var p95 = pts.Count == 0 ? 0 : pts.Max(p => p.P95);
         var reps = _replicas.Latest;
         var reachable = reps.Count(r => r.Reachable);
-        var unbounded = reps.Where(r => r.Reachable && r.Stats?.Labels.Contains("response_time") == true).Select(r => r.Stats?.Pod).ToList();
+        var unbounded = reps.Where(r => r.Reachable && r.Stats is { } s && (s.Labels.Contains("response_time") || s.ExtraLabels > 0)).Select(r => r.Stats?.Pod).ToList();
 
         var checks = new List<Check>
         {
@@ -518,6 +608,8 @@ sealed class LoadTest
             return new
             {
                 state = _state,
+                prepStatus = _prepStatus,
+                prepError = _prepError,
                 dryRun = _config?.DryRun == true,
                 checks = _checks,
                 checksForDryRun = _checksForDryRun,
@@ -576,22 +668,27 @@ static class Labels
 {
     public static LabelConfig Normalize(LabelConfig c) => new(
         LabelSet.All.Where(l => (c.Labels ?? []).Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray(),
-        Math.Clamp(c.ResponseTimeDecimals ?? 6, 0, 6));
+        Math.Clamp(c.ResponseTimeDecimals ?? 6, 0, 6),
+        Math.Clamp(c.ExtraLabels ?? 0, 0, LabelSet.ExtraNames.Length),
+        Math.Clamp(c.ExtraPoolSize ?? 0, 0, LabelSet.MaxPool));
 
     public static LabelConfig ForMode(string mode) =>
-        new(mode == "unbounded" ? LabelSet.All : LabelSet.Bounded, 6);
+        new(mode == "unbounded" ? LabelSet.All : LabelSet.Bounded, 6, 0, 0);
 
-    public static string Key(LabelConfig c)
+    public static string Key(LabelConfig c) =>
+        LabelSet.KeyOf(c.Labels ?? [], c.ResponseTimeDecimals ?? 6, c.ExtraLabels ?? 0, c.ExtraPoolSize ?? 0);
+
+    public static string Describe(LabelConfig c)
     {
-        var l = c.Labels ?? [];
-        return string.Join(",", l) + (l.Contains("response_time") ? $"@{c.ResponseTimeDecimals ?? 6}" : "");
+        var d = (c.Labels ?? []).Length == 0 ? "(no labels)"
+            : string.Join(", ", (c.Labels ?? []).Select(l => l == "response_time" ? $"response_time({c.ResponseTimeDecimals ?? 6}dp)" : l));
+        var n = c.ExtraLabels ?? 0;
+        return n > 0 ? $"{d}, +{n} GUID labels ({((c.ExtraPoolSize ?? 0) == 0 ? "unique" : $"pool {c.ExtraPoolSize:N0}")})" : d;
     }
 
-    public static string Describe(LabelConfig c) =>
-        (c.Labels ?? []).Length == 0 ? "(no labels)"
-            : string.Join(", ", (c.Labels ?? []).Select(l => l == "response_time" ? $"response_time({c.ResponseTimeDecimals ?? 6}dp)" : l));
+    public static string Describe(ReplicaSnapshot s) => Describe(new LabelConfig(s.Labels, s.ResponseTimeDecimals, s.ExtraLabels, s.ExtraPoolSize));
 
-    public static string Describe(ReplicaSnapshot s) => Describe(new LabelConfig(s.Labels, s.ResponseTimeDecimals));
+    public static bool IsHighCardinality(LabelConfig c) => (c.Labels ?? []).Contains("response_time") || (c.ExtraLabels ?? 0) > 0;
 }
 
 // Polls every api replica directly (headless Service DNS) every 2s. Works even when Prometheus is down.
@@ -614,7 +711,7 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
         {
             var snaps = _views.Values.Where(v => v.Reachable && v.Stats is not null).Select(v => v.Stats!).ToList();
             var keys = snaps.Select(s => s.LabelKey).Distinct().ToList();
-            return keys.Count == 1 ? new LabelConfig(snaps[0].Labels, snaps[0].ResponseTimeDecimals) : null;
+            return keys.Count == 1 ? new LabelConfig(snaps[0].Labels, snaps[0].ResponseTimeDecimals, snaps[0].ExtraLabels, snaps[0].ExtraPoolSize) : null;
         }
     }
 
@@ -812,6 +909,7 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
 
     public object? Latest { get; private set; }
     public string AgentProfile { get; private set; } = "unknown";
+    public bool ProtectPrometheus { get; private set; }
 
     public List<PipelineSample> HistorySince(long ts)
     {
@@ -847,6 +945,8 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
         var alloyCpuLimit = await ScalarAsync($"max(kube_pod_container_resource_limits{{{alloy},resource=\"cpu\"}})", ct);
         var alloyCpu = await ScalarAsync($"sum(rate(container_cpu_usage_seconds_total{{{alloy}}}[1m]))", ct);
         var alloyRefused = await ScalarAsync("sum(rate(otelcol_receiver_refused_metric_points_total[1m]))", ct);
+        // Is Alloy running a PROTECT_PROM config (drops response_time/GUID series before Prometheus)?
+        ProtectPrometheus = (await ScalarAsync("count({component_id=\"prometheus.relabel.protect_prometheus\"})", ct) ?? 0) > 0;
         // "constrained" = the make agent-constrained profile (CPU-limited Alloy with a memory_limiter).
         AgentProfile = alloyMem is null && alloyLimit is null ? "unknown"
             : alloyCpuLimit is { } cl && cl <= 0.5 ? "constrained" : "normal";
@@ -859,7 +959,7 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
         {
             up = true, sampledAt = now, headSeries = head, txSeries = tx,
             prometheus = new { memory = promMem, limit = promLimit, restarts = promRestarts, node = promNode },
-            alloy = new { memory = alloyMem, limit = alloyLimit, cpu = alloyCpu, cpuLimit = alloyCpuLimit, refusedPerSec = alloyRefused, profile = AgentProfile },
+            alloy = new { memory = alloyMem, limit = alloyLimit, cpu = alloyCpu, cpuLimit = alloyCpuLimit, refusedPerSec = alloyRefused, profile = AgentProfile, protectPrometheus = ProtectPrometheus },
             nodeMemoryPct = nodes,
         };
         lock (_history)
