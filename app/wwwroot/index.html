@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cardinality Load Test</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5d6673; --line: #e3e6ea; --grid: #eef0f3;
+    --accent: #2f6fde; --ok: #1f9d55; --warn: #c77700; --bad: #d23c3c;
+    --c1: #2f6fde; --c2: #1f9d55; --c3: #d23c3c; --c4: #c77700; --c5: #8a4fd8; --c6: #0e9aa7; --c7: #6b7280;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #9aa4b2; --line: #262c35; --grid: #1f242c;
+      --accent: #6b9cff; --ok: #3ccf7a; --warn: #f0a640; --bad: #ff6b6b;
+      --c1: #6b9cff; --c2: #3ccf7a; --c3: #ff6b6b; --c4: #f0a640; --c5: #b48cff; --c6: #3fd0db; --c7: #9aa4b2;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #9aa4b2; --line: #262c35; --grid: #1f242c;
+    --accent: #6b9cff; --ok: #3ccf7a; --warn: #f0a640; --bad: #ff6b6b;
+    --c1: #6b9cff; --c2: #3ccf7a; --c3: #ff6b6b; --c4: #f0a640; --c5: #b48cff; --c6: #3fd0db; --c7: #9aa4b2;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+          border: 1px solid var(--line); background: var(--panel); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.running .dot { background: var(--ok); animation: pulse 1.2s infinite; }
+  .pill.draining .dot { background: var(--warn); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .grid { display: grid; gap: 14px; }
+  .top { grid-template-columns: 340px 1fr; align-items: start; }
+  @media (max-width: 900px) { .top { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  label { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 6px 0; font-size: 13px; }
+  label span.hint { color: var(--muted); font-size: 12px; }
+  input[type=number] { width: 96px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; text-align: right; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin: 4px 0 6px; }
+  .seg button { border: 0; padding: 8px; background: var(--bg); color: var(--ink); font: inherit; cursor: pointer; }
+  .seg button.on.bounded { background: var(--ok); color: #fff; font-weight: 600; }
+  .seg button.on.unbounded { background: var(--bad); color: #fff; font-weight: 600; }
+  .note { color: var(--muted); font-size: 12px; margin: 2px 0 10px; }
+  .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .btn { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); font: inherit; font-weight: 600; cursor: pointer; background: var(--bg); color: var(--ink); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 520px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .kpi .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .kpi .l { color: var(--muted); font-size: 12px; }
+  .kpi.bad .v { color: var(--bad); } .kpi.warn .v { color: var(--warn); } .kpi.good .v { color: var(--ok); }
+  .milestones { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; }
+  @media (max-width: 900px) { .milestones { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .ms { border-left: 3px solid var(--line); padding: 6px 10px; }
+  .ms.hit { border-left-color: var(--bad); }
+  .ms .t { font-size: 12px; color: var(--muted); }
+  .ms .r { font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .charts { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 14px; }
+  @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-bottom: 4px; min-height: 18px; }
+  .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  .legend b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  svg.chart { width: 100%; height: 190px; display: block; }
+  svg.chart text { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
+  .tables { grid-template-columns: 1.6fr 1fr; margin-top: 14px; }
+  @media (max-width: 1100px) { .tables { grid-template-columns: 1fr; } }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+  th:first-child, td:first-child { text-align: left; }
+  td.mono { font-family: var(--mono); font-size: 11.5px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .tag.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .tag.bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+  .tag.warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .kv div:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; background: var(--grid); border-radius: 3px; overflow: hidden; margin-top: 3px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .reason { margin-top: 10px; font-size: 12.5px; color: var(--muted); }
+  .history { margin-top: 14px; }
+  .err { color: var(--bad); font-size: 12.5px; margin-top: 8px; min-height: 1em; }
+  .btn.dry { width: 100%; margin-top: 8px; border-color: var(--ok); color: var(--ok); }
+  .checks { margin-top: 14px; }
+  .checks ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px; }
+  @media (max-width: 700px) { .checks ul { grid-template-columns: 1fr; } }
+  .checks li { display: grid; grid-template-columns: 22px 1fr; gap: 2px 6px; font-size: 13px; }
+  .checks li .ic { font-weight: 700; }
+  .checks li.ok .ic { color: var(--ok); } .checks li.bad .ic { color: var(--bad); } .checks li.wait .ic { color: var(--muted); }
+  .checks li .d { grid-column: 2; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .seg button:disabled { cursor: not-allowed; opacity: .5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Cardinality Load Test</h1>
+      <div class="sub">transactions-api ×N (OTel SDK in memory) → OTLP every 10s → Alloy (agent pool) → remote_write → Prometheus</div>
+    </div>
+    <span id="statePill" class="pill"><span class="dot"></span><span id="stateText">idle</span></span>
+  </header>
+
+  <div class="grid top">
+    <section class="panel">
+      <h2>Test setup</h2>
+      <div style="font-size:13px">Metric labels</div>
+      <div class="seg" id="modeSeg">
+        <button data-mode="bounded" class="bounded">Bounded</button>
+        <button data-mode="unbounded" class="unbounded">+ response_time label</button>
+      </div>
+      <div class="note" id="modeNote">consume_type × state × product × pod (200). Applies to all replicas immediately.</div>
+
+      <label>Start rate <span><input id="startRate" type="number" value="50" min="1"> <span class="hint">req/s</span></span></label>
+      <label>Step increase <span><input id="stepRate" type="number" value="50" min="0"> <span class="hint">req/s</span></span></label>
+      <label>Step duration <span><input id="stepSeconds" type="number" value="30" min="5"> <span class="hint">s</span></span></label>
+      <label>Max rate <span><input id="maxRate" type="number" value="2000" min="1"> <span class="hint">req/s</span></span></label>
+      <label>Request timeout <span><input id="timeoutMs" type="number" value="3000" min="100" step="100"> <span class="hint">ms</span></span></label>
+      <label>Degraded when p95 ≥ <span><input id="degradedP95Ms" type="number" value="1000" min="10" step="50"> <span class="hint">ms</span></span></label>
+      <label>Auto-stop at errors ≥ <span><input id="stopErrorPct" type="number" value="50" min="1" max="100"> <span class="hint">%</span></span></label>
+
+      <div class="actions">
+        <button class="btn primary" id="startBtn">Start test</button>
+        <button class="btn" id="stopBtn" disabled>Stop</button>
+      </div>
+      <button class="btn dry" id="dryBtn" title="~60s at 20→100 req/s with bounded labels, then end-to-end checks">Dry run (safe)</button>
+      <div class="note" style="margin-top:6px">Dry run: about 60s at 20→100 req/s, labels locked to bounded, stops at 5% errors. Then it checks every hop: app → Alloy → Prometheus → Grafana.</div>
+      <div class="err" id="err"></div>
+      <div class="reason" id="reason"></div>
+    </section>
+
+    <section>
+      <div class="grid kpis">
+        <div class="panel kpi"><div class="l">Target rate</div><div class="v" id="kTarget">–</div></div>
+        <div class="panel kpi good"><div class="l">Succeeded / s</div><div class="v" id="kOk">–</div></div>
+        <div class="panel kpi" id="kFailBox"><div class="l">Failed / s · error %</div><div class="v" id="kFail">–</div></div>
+        <div class="panel kpi" id="kP95Box"><div class="l">p95 latency</div><div class="v" id="kP95">–</div></div>
+        <div class="panel kpi"><div class="l">In flight</div><div class="v" id="kInflight">–</div></div>
+        <div class="panel kpi"><div class="l">Elapsed</div><div class="v" id="kElapsed">–</div></div>
+      </div>
+      <div class="panel grid milestones">
+        <div class="ms" id="msDegraded"><div class="t">Degradation (p95 threshold)</div><div class="r">–</div></div>
+        <div class="ms" id="msTimeout"><div class="t">First timeout</div><div class="r">–</div></div>
+        <div class="ms" id="msErr5"><div class="t">Errors ≥ 5%</div><div class="r">–</div></div>
+        <div class="ms" id="msErr50"><div class="t">Errors ≥ 50% (collapse)</div><div class="r">–</div></div>
+      </div>
+      <div class="panel checks" id="checksPanel" hidden>
+        <h2 id="checksTitle">Dry-run checks</h2>
+        <ul id="checksList"></ul>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid charts">
+    <section class="panel"><h2>Throughput</h2><div class="legend" id="lgRate"></div><svg class="chart" id="chRate"></svg></section>
+    <section class="panel"><h2>Latency (client-side)</h2><div class="legend" id="lgLat"></div><svg class="chart" id="chLat"></svg></section>
+    <section class="panel"><h2>Failures by type / s</h2><div class="legend" id="lgFail"></div><svg class="chart" id="chFail"></svg></section>
+    <section class="panel"><h2>Replica memory (cgroup)</h2><div class="legend" id="lgMem"></div><svg class="chart" id="chMem"></svg></section>
+    <section class="panel"><h2>Replica CPU throttling</h2><div class="legend" id="lgCpu"></div><svg class="chart" id="chCpu"></svg></section>
+    <section class="panel"><h2>Metrics pipeline</h2><div class="legend" id="lgPipe"></div><svg class="chart" id="chPipe"></svg></section>
+  </div>
+
+  <div class="grid tables">
+    <section class="panel">
+      <h2>Replicas under test</h2>
+      <div class="scroll"><table id="replicaTable"></table></div>
+    </section>
+    <section class="panel">
+      <h2>Prometheus · Alloy · nodes</h2>
+      <div id="pipeline" class="kv"></div>
+    </section>
+  </div>
+
+  <section class="panel history">
+    <h2>Run history (compare bounded vs response_time label)</h2>
+    <div class="scroll"><table id="historyTable"></table></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let points = [], startedAt = 0, last = null, busy = false;
+
+const fmtN = (v, d = 0) => v == null || isNaN(v) ? '–' : Number(v).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+const fmtB = (b) => b == null ? '–' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GiB' : (b / 1048576).toFixed(0) + ' MiB';
+const fmtMs = (ms) => ms == null ? '–' : ms >= 1000 ? (ms / 1000).toFixed(2) + ' s' : Math.round(ms) + ' ms';
+const fmtT = (s) => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const fmtSi = (v) => v == null ? '–' : v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : Math.round(v);
+
+// ---------- tiny SVG line chart ----------
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+}
+function drawChart(svg, legendEl, series, opts = {}) {
+  const W = svg.clientWidth || 600, H = svg.clientHeight || 190, L = 52, R = 10, T = 8, B = 20;
+  const all = series.flatMap(s => s.pts.map(p => p[1])).filter(v => v != null);
+  const xs = series.flatMap(s => s.pts.map(p => p[0]));
+  const xMax = Math.max(opts.xMin ?? 60, ...xs, 1);
+  const yMax = opts.yMax ?? niceMax(Math.max(...all, ...(opts.refs || []).map(r => r.y), 0) * 1.05);
+  const X = (x) => L + (x / xMax) * (W - L - R), Y = (y) => T + (1 - Math.min(y, yMax) / yMax) * (H - T - B);
+  const yf = opts.yFmt || fmtSi;
+  let g = '';
+  for (let i = 0; i <= 4; i++) {
+    const y = yMax * i / 4, py = Y(y);
+    g += `<line x1="${L}" x2="${W - R}" y1="${py}" y2="${py}" stroke="${css('--grid')}"/>`;
+    g += `<text x="${L - 6}" y="${py + 3}" text-anchor="end">${yf(y)}</text>`;
+  }
+  for (let i = 0; i <= 5; i++) {
+    const x = xMax * i / 5;
+    g += `<text x="${X(x)}" y="${H - 5}" text-anchor="middle">${fmtT(x)}</text>`;
+  }
+  for (const r of (opts.refs || [])) {
+    g += `<line x1="${L}" x2="${W - R}" y1="${Y(r.y)}" y2="${Y(r.y)}" stroke="${css(r.color || '--c7')}" stroke-dasharray="4 4"/>`;
+    g += `<text x="${W - R - 2}" y="${Y(r.y) - 4}" text-anchor="end">${r.label}</text>`;
+  }
+  for (const s of series) {
+    let d = '', pen = false;
+    for (const [x, y] of s.pts) {
+      if (y == null) { pen = false; continue; }
+      d += (pen ? 'L' : 'M') + X(x).toFixed(1) + ' ' + Y(y).toFixed(1);
+      pen = true;
+    }
+    g += `<path d="${d}" fill="none" stroke="${css(s.color)}" stroke-width="${s.width || 1.8}" stroke-linejoin="round" ${s.dash ? `stroke-dasharray="${s.dash}"` : ''}/>`;
+  }
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = g;
+  legendEl.innerHTML = series.map(s => {
+    const lastPt = [...s.pts].reverse().find(p => p[1] != null);
+    return `<span><i style="background:${css(s.color)}"></i>${s.name} <b>${lastPt ? (s.fmt || yf)(lastPt[1]) : '–'}</b></span>`;
+  }).join('');
+}
+
+// ---------- rendering ----------
+function render(data) {
+  const t = data.test, cfg = t.config, cur = t.current;
+  $('stateText').textContent = t.state === 'running' ? (t.dryRun ? 'dry run · bounded' : `running · ${t.mode}`)
+    : t.state === 'checking' ? 'dry run · checking pipeline' : t.state;
+  $('statePill').className = 'pill ' + (t.state === 'checking' ? 'draining' : t.state);
+  $('startBtn').disabled = t.state !== 'idle';
+  $('dryBtn').disabled = t.state !== 'idle';
+  $('stopBtn').disabled = t.state !== 'running';
+  const locked = t.dryRun && t.state !== 'idle';
+  document.querySelectorAll('#modeSeg button').forEach(b => b.disabled = locked && b.dataset.mode === 'unbounded');
+
+  const checks = t.checks || [];
+  const showChecks = t.checksForDryRun && (t.state !== 'idle' || checks.length);
+  $('checksPanel').hidden = !showChecks;
+  if (showChecks) {
+    const passed = checks.filter(c => c.ok).length;
+    $('checksTitle').textContent = checks.length
+      ? `Dry-run checks · ${passed}/${checks.length} passed${passed === checks.length ? ', all clear for the real test' : ''}`
+      : 'Dry-run checks · waiting for the run to finish…';
+    $('checksList').innerHTML = checks.length
+      ? checks.map(c => `<li class="${c.ok ? 'ok' : 'bad'}"><span class="ic">${c.ok ? '✓' : '✗'}</span><span>${c.name}</span><span class="d">${c.detail}</span></li>`).join('')
+      : '<li class="wait"><span class="ic">…</span><span>Sending traffic; checks run when the dry run ends.</span></li>';
+  }
+  $('reason').textContent = t.stopReason ? 'Last stop: ' + t.stopReason : '';
+
+  const mode = data.replicas.desiredMode || data.replicas.observedMode;
+  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  $('modeNote').textContent = mode === 'unbounded'
+    ? 'response_time="0.023417" is added as a label: nearly every request becomes a new series.'
+    : mode === 'mixed' ? 'Replicas disagree (one is restarting?). Click a mode to re-apply.'
+    : 'consume_type × state × product × pod (200). Applies to all replicas immediately.';
+
+  const running = t.state !== 'idle';
+  $('kTarget').textContent = running ? fmtN(t.targetRate) : '–';
+  $('kOk').textContent = points.length ? fmtN(cur.okPerSec) : '–';
+  $('kFail').textContent = points.length ? `${fmtN(cur.failedPerSec)} · ${fmtN(cur.errorPct, 1)}%` : '–';
+  $('kFailBox').className = 'panel kpi ' + (cur.errorPct >= 5 ? 'bad' : cur.errorPct > 0 ? 'warn' : '');
+  $('kP95').textContent = points.length ? fmtMs(cur.p95) : '–';
+  $('kP95Box').className = 'panel kpi ' + (cfg && cur.p95 >= cfg.degradedP95Ms ? 'bad' : cfg && cur.p95 >= cfg.degradedP95Ms / 2 ? 'warn' : '');
+  $('kInflight').textContent = running ? fmtN(t.inFlight) : '–';
+  $('kElapsed').textContent = points.length ? fmtT(points[points.length - 1].t) : '–';
+
+  const ms = t.milestones || {};
+  const setMs = (id, m) => {
+    const el = $(id);
+    el.classList.toggle('hit', !!m);
+    el.querySelector('.r').textContent = m ? `${fmtN(m.rate)} req/s @ ${fmtT(m.t)}` : '–';
+    el.title = m ? m.what : '';
+  };
+  setMs('msDegraded', ms.degraded); setMs('msTimeout', ms.firstTimeout); setMs('msErr5', ms.errors5); setMs('msErr50', ms.errors50);
+
+  // charts
+  const P = (f) => points.map(p => [p.t, f(p)]);
+  drawChart($('chRate'), $('lgRate'), [
+    { name: 'target', color: '--c7', pts: P(p => p.target), dash: '5 4' },
+    { name: 'succeeded/s', color: '--c2', pts: P(p => p.ok) },
+    { name: 'failed/s', color: '--c3', pts: P(p => p.timeouts + p.httpErrors + p.connErrors + p.dropped) },
+  ]);
+  drawChart($('chLat'), $('lgLat'), [
+    { name: 'p50', color: '--c1', pts: P(p => p.p50) },
+    { name: 'p95', color: '--c4', pts: P(p => p.p95) },
+    { name: 'p99', color: '--c3', pts: P(p => p.p99) },
+  ], { yFmt: fmtMs, refs: cfg ? [{ y: cfg.timeoutMs, label: 'timeout', color: '--c3' }, { y: cfg.degradedP95Ms, label: 'degraded', color: '--c4' }] : [] });
+  drawChart($('chFail'), $('lgFail'), [
+    { name: 'timeouts', color: '--c4', pts: P(p => p.timeouts) },
+    { name: 'HTTP 5xx', color: '--c3', pts: P(p => p.httpErrors) },
+    { name: 'connection', color: '--c5', pts: P(p => p.connErrors) },
+    { name: 'dropped (driver)', color: '--c7', pts: P(p => p.dropped) },
+  ]);
+
+  const rh = data.replicaHistory || [], pods = [...new Set(rh.map(s => s.pod))].sort();
+  const colors = ['--c1', '--c2', '--c4', '--c5', '--c6', '--c3', '--c7'];
+  const limit = (data.replicas.pods.find(p => p.stats?.memoryLimitBytes) || {}).stats?.memoryLimitBytes;
+  drawChart($('chMem'), $('lgMem'), pods.map((pod, i) => ({
+    name: pod.split('-').pop(), color: colors[i % colors.length], fmt: fmtB,
+    pts: rh.filter(s => s.pod === pod).map(s => [s.ts - startedAt, s.reachable ? s.memoryBytes : null]),
+  })), { yFmt: fmtB, refs: limit ? [{ y: limit, label: 'limit', color: '--c3' }] : [] });
+  drawChart($('chCpu'), $('lgCpu'), pods.map((pod, i) => ({
+    name: pod.split('-').pop(), color: colors[i % colors.length], fmt: (v) => fmtN(v, 0) + '%',
+    pts: rh.filter(s => s.pod === pod).map(s => [s.ts - startedAt, s.throttledPct]),
+  })), { yMax: 100, yFmt: (v) => v + '%' });
+
+  const ph = data.pipelineHistory || [];
+  const maxHead = Math.max(...ph.map(s => s.headSeries || 0), 1);
+  drawChart($('chPipe'), $('lgPipe'), [
+    { name: 'Prometheus head series', color: '--c1', pts: ph.map(s => [s.ts - startedAt, s.headSeries]) },
+    { name: 'http_transactions_total series', color: '--c5', pts: ph.map(s => [s.ts - startedAt, s.txSeries]) },
+  ], { yMax: niceMax(maxHead * 1.05) });
+
+  renderReplicas(data.replicas.pods);
+  renderPipeline(data.pipeline);
+  renderHistory(t.history);
+}
+
+function renderReplicas(pods) {
+  const rows = pods.map(v => {
+    const s = v.stats || {};
+    const memPct = s.memoryLimitBytes ? 100 * s.memoryCurrentBytes / s.memoryLimitBytes : null;
+    const status = !v.reachable ? `<span class="tag bad">${v.lastError || 'down'}</span>`
+      : `<span class="tag ${s.mode === 'unbounded' ? 'bad' : 'ok'}">${s.mode}</span>`;
+    return `<tr>
+      <td class="mono">${s.pod || v.ip}</td><td>${status}</td>
+      <td>${v.restartsSeen ? `<span class="tag warn">${v.restartsSeen}</span>` : 0}</td>
+      <td>${fmtB(s.memoryCurrentBytes)}<div class="bar"><span style="width:${Math.min(100, memPct || 0)}%;background:${memPct > 85 ? css('--bad') : css('--accent')}"></span></div></td>
+      <td>${fmtB(s.gcHeapBytes)}</td>
+      <td>${fmtN(v.cpuCores, 2)}${s.cpuLimitCores ? ' / ' + s.cpuLimitCores : ''}</td>
+      <td>${v.throttledPct == null ? '–' : fmtN(v.throttledPct, 0) + '%'}</td>
+      <td>${fmtN(s.gcPauseTimePercent, 1)}%</td>
+      <td>${fmtN(s.threadPoolQueue)}</td>
+      <td>${fmtSi(s.unboundedRecords)}</td>
+      <td>${fmtSi(s.transactions)}</td>
+    </tr>`;
+  }).join('');
+  $('replicaTable').innerHTML = `<tr><th>Pod</th><th>Labels</th><th>Restarts</th><th>Memory</th><th>GC heap</th><th>CPU cores</th>
+    <th>Throttled</th><th>GC pause</th><th>Pool queue</th><th>Labelled recs</th><th>Transactions</th></tr>${rows || '<tr><td colspan="11">No replicas found</td></tr>'}`;
+}
+
+function renderPipeline(p) {
+  if (!p) { $('pipeline').innerHTML = '<div>Prometheus</div><div>waiting…</div>'; return; }
+  if (!p.up) { $('pipeline').innerHTML = `<div>Prometheus</div><div><span class="tag bad">DOWN</span> ${p.error || ''}</div>`; return; }
+  const pr = p.prometheus, al = p.alloy;
+  const pct = (a, b) => a && b ? ` (${fmtN(100 * a / b, 0)}%)` : '';
+  let html = `
+    <div>Prometheus</div><div><span class="tag ok">up</span>${pr.restarts ? ` <span class="tag warn">${pr.restarts} restarts</span>` : ''}</div>
+    <div>Head series</div><div>${fmtSi(p.headSeries)}</div>
+    <div>http_transactions_total series</div><div>${fmtSi(p.txSeries)}</div>
+    <div>Prometheus memory</div><div>${fmtB(pr.memory)} / ${pr.limit ? fmtB(pr.limit) : '<span class="tag warn">no limit</span>'}${pct(pr.memory, pr.limit)}</div>
+    <div>Prometheus node</div><div class="mono">${pr.node || '–'}</div>
+    <div>Alloy memory</div><div>${fmtB(al.memory)} / ${fmtB(al.limit)}${pct(al.memory, al.limit)}</div>`;
+  for (const [node, v] of Object.entries(p.nodeMemoryPct || {}).sort()) {
+    html += `<div class="mono">${node.replace('k3d-', '')}</div><div>${fmtN(v, 0)}%<div class="bar"><span style="width:${Math.min(100, v)}%;background:${v > 85 ? css('--bad') : css('--accent')}"></span></div></div>`;
+  }
+  $('pipeline').innerHTML = html;
+}
+
+function renderHistory(h) {
+  const m = (x) => x ? `${fmtN(x.rate)} req/s` : '–';
+  const rows = (h || []).map(r => `<tr>
+    <td class="mono">${r.startedAt.replace('Z', '')}</td>
+    <td><span class="tag ${r.mode === 'unbounded' ? 'bad' : 'ok'}">${r.mode}</span></td>
+    <td>${fmtT(r.durationSeconds)}</td><td>${fmtN(r.maxTargetRate)}</td><td>${fmtN(r.peakOkPerSec)}</td>
+    <td>${m(r.degraded)}</td><td>${m(r.firstTimeout)}</td><td>${m(r.errors5)}</td><td>${m(r.errors50)}</td>
+    <td style="text-align:left;white-space:normal">${r.stopReason || ''}</td></tr>`).join('');
+  $('historyTable').innerHTML = `<tr><th>Started (UTC)</th><th>Labels</th><th>Duration</th><th>Max target</th><th>Peak ok/s</th>
+    <th>Degraded at</th><th>First timeout at</th><th>≥5% errors at</th><th>≥50% errors at</th><th style="text-align:left">Stop reason</th></tr>
+    ${rows || '<tr><td colspan="10" style="text-align:left">No completed runs yet. Run once bounded, then once with the response_time label.</td></tr>'}`;
+}
+
+// ---------- polling & actions ----------
+async function poll() {
+  if (busy) return;
+  busy = true;
+  try {
+    const res = await fetch(`/api/test/status?since=${points.length}`);
+    const data = await res.json();
+    if (data.test.startedAtUnix !== startedAt) { startedAt = data.test.startedAtUnix; points = []; return; }
+    if (data.test.pointsFrom === points.length) points.push(...data.test.points);
+    last = data;
+    render(data);
+    $('err').textContent = '';
+  } catch (e) {
+    $('err').textContent = 'Driver unreachable: ' + e.message;
+  } finally { busy = false; }
+}
+
+async function startRun(path) {
+  const body = {};
+  for (const k of ['startRate', 'stepRate', 'stepSeconds', 'maxRate', 'timeoutMs', 'degradedP95Ms', 'stopErrorPct']) body[k] = Number($(k).value);
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not start';
+  poll();
+}
+$('startBtn').onclick = () => startRun('/api/test/start');
+$('dryBtn').onclick = () => startRun('/api/test/dryrun');
+$('stopBtn').onclick = async () => { await fetch('/api/test/stop', { method: 'POST' }); poll(); };
+document.querySelectorAll('#modeSeg button').forEach(b => b.onclick = async () => {
+  const r = await fetch(`/api/mode?value=${b.dataset.mode}`, { method: 'POST' });
+  if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not change labels';
+  poll();
+});
+window.addEventListener('resize', () => last && render(last));
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

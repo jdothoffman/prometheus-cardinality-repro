@@ -6,14 +6,18 @@ IMAGE          ?= transactions-api:local
 KPS_VERSION    ?= 93.3.0
 ALLOY_VERSION  ?= 1.15.0
 AGENT_POOL_MEM ?= 1280m
+APP_NODE_CPUS  ?= 3
+AGENT_NODE_CPUS ?= 2
 RATE           ?= 300
 DURATION       ?= 30m
 PROM_POD       := prometheus-kps-prometheus-0
 APP            := deploy/transactions-api
+DRIVER         := deploy/transactions-driver
+APP_NODES      := k3d-$(CLUSTER)-agent-0 k3d-$(CLUSTER)-agent-1
 
 .PHONY: help prereqs up monitoring agent app all ui load load-stop load-logs explode calm churn \
         unchurn reset-prometheus agent-down agent-up guard-agent unguard-agent fix-app unfix-app \
-        cap-app uncap-app status watch down
+        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -26,7 +30,13 @@ up: ## Create the cluster: control plane + "app" pool (2 nodes) + tainted "agent
 	k3d node create agentpool -c $(CLUSTER) --role agent --memory $(AGENT_POOL_MEM) \
 	  --k3s-node-label pool=agent --k3s-arg "--node-taint=pool=agent:NoSchedule"
 	$(K) wait --for=condition=Ready nodes --all --timeout=180s
+	$(MAKE) node-cpus
 	$(K) get nodes -L pool
+
+node-cpus: ## Cap real CPUs per node (app pool APP_NODE_CPUS=3, agent pool 2) so CPU can actually run out
+	docker update --cpus $(APP_NODE_CPUS) $(APP_NODES) >/dev/null
+	docker update --cpus $(AGENT_NODE_CPUS) k3d-agentpool-0 >/dev/null
+	@for n in $(APP_NODES) k3d-agentpool-0; do echo "$$n: $$(docker inspect -f '{{.HostConfig.NanoCpus}}' $$n | awk '{print $$1/1e9}') CPUs"; done
 
 monitoring: ## Install kube-prometheus-stack (Prometheus w/ remote-write receiver, Grafana) + dashboard
 	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
@@ -34,6 +44,14 @@ monitoring: ## Install kube-prometheus-stack (Prometheus w/ remote-write receive
 	  --version $(KPS_VERSION) -n monitoring --create-namespace \
 	  -f monitoring/values.yaml --wait --timeout 10m
 	$(K) apply -k monitoring/dashboards
+
+profile-starvation: ## Prometheus as noisy neighbour: no memory limit, on the app pool next to the app
+	$(H) upgrade --install kps prometheus-community/kube-prometheus-stack --version $(KPS_VERSION) \
+	  -n monitoring -f monitoring/values.yaml -f monitoring/values-starvation.yaml --wait --timeout 10m
+
+profile-oom: ## Default profile: Prometheus capped at 1Gi (OOMKilled -> CrashLoopBackOff)
+	$(H) upgrade --install kps prometheus-community/kube-prometheus-stack --version $(KPS_VERSION) \
+	  -n monitoring -f monitoring/values.yaml --wait --timeout 10m
 
 agent: ## Install Grafana Alloy on the agent pool (unguarded config)
 	$(MAKE) _alloy CONFIG=agent/config.alloy
@@ -45,24 +63,27 @@ _alloy:
 	$(K) -n alloy rollout restart deploy/alloy
 	$(K) -n alloy rollout status deploy/alloy --timeout=120s
 
-app: ## Build the .NET app, import into k3d, deploy to the app pool
+app: ## Build the .NET image, import into k3d, deploy the api replicas + the load-test driver
 	docker build -t $(IMAGE) app
 	k3d image import $(IMAGE) -c $(CLUSTER)
 	$(K) apply -f k8s/app.yaml
-	$(K) -n demo rollout restart $(APP)
+	$(K) -n demo rollout restart $(APP) $(DRIVER)
 	$(K) -n demo rollout status $(APP) --timeout=180s
+	$(K) -n demo rollout status $(DRIVER) --timeout=120s
 
 all: up monitoring agent app ## up + monitoring + agent + app
 
-ui: ## Port-forward Grafana :3000 and Prometheus :9090 (Ctrl-C to stop)
+ui: ## Port-forward the load-test console :8080, Grafana :3000, Prometheus :9090 (Ctrl-C to stop)
+	@echo "Load test  http://localhost:8080  <- Start button"
 	@echo "Grafana    http://localhost:3000  (admin/admin) -> Dashboards > Cardinality Repro"
 	@echo "Prometheus http://localhost:9090"
 	@trap 'kill 0' INT TERM; \
+	  while true; do $(K) -n demo port-forward svc/transactions-driver 8080:8080; sleep 2; done & \
 	  $(K) -n monitoring port-forward svc/kps-grafana 3000:80 & \
 	  while true; do $(K) -n monitoring port-forward svc/kps-prometheus 9090:9090; sleep 3; done & \
 	  wait
 
-load: ## Start k6 load (RATE=req/s, default 300; DURATION=30m)
+load: ## Alternative to the UI: constant k6 load (RATE=req/s, default 300; DURATION=30m)
 	$(K) -n demo delete job k6-load --ignore-not-found
 	sed -e 's/__RATE__/$(RATE)/' -e 's/__DURATION__/$(DURATION)/' k8s/load-k6.yaml | $(K) apply -f -
 

@@ -29,7 +29,9 @@ spec:
           env:
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: APP_ROLE, value: api }
             - { name: CARDINALITY_MODE, value: bounded }
+            - { name: CPU_WORK_ITERATIONS, value: "50" }
             - { name: VIRTUAL_PODS, value: "50" }
             - { name: POD_CHURN_SECONDS, value: "0" }
             - { name: OTEL_CARDINALITY_LIMIT, value: "200000" }
@@ -40,9 +42,10 @@ spec:
             - { name: OTEL_METRIC_EXPORT_TIMEOUT, value: "8000" }
             - { name: DOTNET_gcServer, value: "0" }
             - { name: Logging__LogLevel__Microsoft.AspNetCore, value: Warning }
+          # A CPU limit, as in production: when the pod needs more, it is throttled and requests queue.
           resources:
-            requests: { cpu: 100m, memory: 192Mi }
-            limits: { memory: 768Mi }
+            requests: { cpu: 250m, memory: 192Mi }
+            limits: { cpu: "1", memory: 768Mi }
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 5
@@ -59,5 +62,73 @@ metadata:
   labels: { app: transactions-api }
 spec:
   selector: { app: transactions-api }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+# Headless Service: lets the driver reach every replica directly (stats + label mode), including
+# replicas that are restarting (publishNotReadyAddresses).
+apiVersion: v1
+kind: Service
+metadata:
+  name: transactions-api-headless
+  namespace: demo
+  labels: { app: transactions-api }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: transactions-api }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+# Load-test console (same image, APP_ROLE=driver). Runs on the control-plane node so generating load
+# doesn't compete for CPU with the replicas under test on the app pool.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transactions-driver
+  namespace: demo
+  labels: { app: transactions-driver }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: transactions-driver }
+  template:
+    metadata:
+      labels: { app: transactions-driver }
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: driver
+          image: transactions-api:local
+          imagePullPolicy: Never
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: APP_ROLE, value: driver }
+            - { name: TARGET_URL, value: "http://transactions-api.demo.svc.cluster.local:8080" }
+            - { name: REPLICA_DNS, value: "transactions-api-headless.demo.svc.cluster.local" }
+            - { name: PROMETHEUS_URL, value: "http://kps-prometheus.monitoring.svc:9090" }
+            # Dry-run check that the Grafana dashboard is provisioned (local-only default credentials).
+            - { name: GRAFANA_URL, value: "http://kps-grafana.monitoring.svc" }
+            - { name: GRAFANA_USER, value: admin }
+            - { name: GRAFANA_PASSWORD, value: admin }
+            - { name: Logging__LogLevel__Microsoft.AspNetCore, value: Warning }
+            - { name: Logging__LogLevel__System.Net.Http.HttpClient, value: Warning }
+          resources:
+            requests: { cpu: 500m, memory: 128Mi }
+            limits: { memory: 768Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transactions-driver
+  namespace: demo
+  labels: { app: transactions-driver }
+spec:
+  selector: { app: transactions-driver }
   ports:
     - { name: http, port: 8080, targetPort: http }
