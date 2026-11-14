@@ -1,0 +1,51 @@
+# kube-prometheus-stack overrides for the cardinality repro.
+fullnameOverride: kps
+
+# k3s does not expose these control-plane components; avoid permanently-down targets.
+kubeEtcd: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeProxy: { enabled: false }
+defaultRules:
+  rules:
+    etcd: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeControllerManager: false
+    kubeProxy: false
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 128Mi }
+
+grafana:
+  adminPassword: admin
+  defaultDashboardsTimezone: browser
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 10s
+    evaluationInterval: 30s
+    retention: 6h
+    walCompression: true
+    # App metrics arrive by push: Alloy (and k6) remote-write into Prometheus.
+    enableRemoteWriteReceiver: true
+    # Pick up ServiceMonitors/PodMonitors/rules from any namespace without Helm release labels.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    # THE OOM TRIGGER. Head series cost memory; once unbounded labels push the head past this,
+    # the container is OOMKilled, and WAL replay on restart OOMs again -> CrashLoopBackOff.
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { memory: 1Gi }
+    # No storageSpec -> emptyDir. Survives container restarts (so WAL replay happens) but is
+    # wiped when the pod is deleted (`make reset-prometheus`).

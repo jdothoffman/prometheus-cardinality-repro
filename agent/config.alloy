@@ -1,0 +1,44 @@
+// Grafana Alloy agent: production-like, NO guardrails.
+// transactions-api (OTel SDK, in-memory, pushes every 10s) --OTLP--> Alloy --remote_write--> Prometheus
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// 1. Receive the OTLP pushes from the app.
+otelcol.receiver.otlp "default" {
+  http {
+    endpoint              = "0.0.0.0:4318"
+    max_request_body_size = "64MiB" // raised from 20MiB: cumulative exports grow with every new series
+  }
+  grpc {
+    endpoint          = "0.0.0.0:4317"
+    max_recv_msg_size = "64MiB" // raised from 4MiB
+  }
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+// 2. Hold metrics in memory and flush on a schedule.
+otelcol.processor.batch "default" {
+  timeout             = "10s"
+  send_batch_size     = 8192
+  send_batch_max_size = 16384
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+// 3. Convert OTLP to Prometheus samples (keeps a per-series cache, GC'd every 5m).
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+// 4. Forward to Prometheus (WAL plus in-memory shard queues, shipped continuously).
+prometheus.remote_write "prometheus" {
+  endpoint {
+    url = "http://kps-prometheus.monitoring.svc:9090/api/v1/write"
+  }
+}

@@ -1,0 +1,33 @@
+# grafana/alloy chart values. The pipeline itself is passed with
+#   --set-file alloy.configMap.content=agent/config.alloy   (or config-guarded.alloy)
+controller:
+  type: deployment
+  replicas: 1
+  # Dedicated "agent" node pool (created by `make up`): only Alloy is scheduled there.
+  nodeSelector:
+    pool: agent
+  tolerations:
+    - key: pool
+      operator: Equal
+      value: agent
+      effect: NoSchedule
+
+alloy:
+  configMap:
+    create: true
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+# Prometheus scrapes Alloy's own health metrics (receiver accepted/refused, remote_write queue, memory).
+serviceMonitor:
+  enabled: true

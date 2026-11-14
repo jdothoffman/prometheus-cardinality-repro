@@ -1,0 +1,71 @@
+# k6 load generator. `make load` substitutes __RATE__ and __DURATION__.
+# k6 remote-writes its own client-side latency straight to Prometheus (not through Alloy), so you
+# can show that HTTP transactions stay fast while the metrics pipeline is exploding or down.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-script
+  namespace: demo
+data:
+  script.js: |
+    import http from 'k6/http';
+
+    const BASE = __ENV.TARGET || 'http://transactions-api.demo.svc.cluster.local:8080';
+
+    export const options = {
+      discardResponseBodies: true,
+      scenarios: {
+        transactions: {
+          executor: 'constant-arrival-rate',
+          rate: Number(__ENV.RATE || 300),
+          timeUnit: '1s',
+          duration: __ENV.DURATION || '30m',
+          preAllocatedVUs: 50,
+          maxVUs: 300,
+        },
+      },
+    };
+
+    const products = ['checking', 'savings', 'credit-card', 'mortgage', 'auto-loan',
+      'personal-loan', 'brokerage', 'retirement', 'insurance', 'payments'];
+    const consumeTypes = ['api', 'web', 'mobile', 'batch'];
+    const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+    export default function () {
+      http.post(
+        `${BASE}/api/transactions?product=${pick(products)}&consumeType=${pick(consumeTypes)}`,
+        null,
+        { tags: { name: 'transaction' }, responseCallback: http.expectedStatuses(200, 202, 402, 500) },
+      );
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-load
+  namespace: demo
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        pool: app
+      containers:
+        - name: k6
+          image: grafana/k6:1.8.3
+          args: ["run", "--quiet", "-o", "experimental-prometheus-rw", "/scripts/script.js"]
+          env:
+            - { name: RATE, value: "__RATE__" }
+            - { name: DURATION, value: "__DURATION__" }
+            - { name: K6_PROMETHEUS_RW_SERVER_URL, value: "http://kps-prometheus.monitoring.svc:9090/api/v1/write" }
+            - { name: K6_PROMETHEUS_RW_TREND_STATS, value: "p(95),p(99),avg" }
+            - { name: K6_PROMETHEUS_RW_PUSH_INTERVAL, value: "10s" }
+          resources:
+            requests: { cpu: 300m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+      volumes:
+        - name: script
+          configMap: { name: k6-script }

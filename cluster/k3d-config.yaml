@@ -1,0 +1,30 @@
+# k3d cluster for the cardinality repro.
+#   server-0            control plane (+ monitoring may land here)
+#   agent-0, agent-1    "app" node pool          (label pool=app)
+#   agentpool-0         "agent" node pool for Alloy (label pool=agent, taint pool=agent:NoSchedule)
+#                       -> created separately by `make up` with `k3d node create`, because k3d
+#                          applies one memory size to every agent in a config file.
+# Memory caps total ~7.25GB, inside the 8GB Docker Desktop VM. If you can, raise the VM to 12GB+.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: cardinality
+servers: 1
+agents: 2
+image: rancher/k3s:v1.36.6-k3s1
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+    nodeLabels:
+      - label: pool=app
+        nodeFilters:
+          - agent:*
+  runtime:
+    serversMemory: 1536m
+    agentsMemory: 2304m
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

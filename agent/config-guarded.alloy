@@ -1,0 +1,61 @@
+// Grafana Alloy agent WITH guardrails (`make guard-agent`). Compare with config.alloy.
+//   - memory_limiter: Alloy refuses data before it OOMs. The app's background exporter gets an
+//     error and drops that export; app HTTP requests are unaffected.
+//   - prometheus.relabel: drops any series carrying response_time before it reaches Prometheus.
+//     (Dropping only the label would make series collide and corrupt the counter values.)
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+otelcol.receiver.otlp "default" {
+  http {
+    endpoint              = "0.0.0.0:4318"
+    max_request_body_size = "64MiB"
+  }
+  grpc {
+    endpoint          = "0.0.0.0:4317"
+    max_recv_msg_size = "64MiB"
+  }
+  output {
+    metrics = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+otelcol.processor.memory_limiter "default" {
+  check_interval         = "1s"
+  limit_percentage       = 75
+  spike_limit_percentage = 20
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  timeout             = "10s"
+  send_batch_size     = 8192
+  send_batch_max_size = 16384
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.relabel.drop_unbounded.receiver]
+}
+
+prometheus.relabel "drop_unbounded" {
+  rule {
+    source_labels = ["response_time"]
+    regex         = ".+"
+    action        = "drop"
+  }
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+prometheus.remote_write "prometheus" {
+  endpoint {
+    url = "http://kps-prometheus.monitoring.svc:9090/api/v1/write"
+  }
+}
