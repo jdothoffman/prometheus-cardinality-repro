@@ -56,11 +56,11 @@ profile-oom: ## Default profile: Prometheus capped at 1Gi (OOMKilled -> CrashLoo
 agent: ## Install Grafana Alloy on the agent pool (unguarded config)
 	$(MAKE) _alloy CONFIG=agent/config.alloy
 
-agent-normal: ## Agent profile "normal": 1Gi, no CPU limit, no memory_limiter (same as make agent)
-	$(MAKE) _alloy CONFIG=agent/config.alloy
+agent-normal: ## Agent profile "normal": 1Gi, no CPU limit, no memory_limiter. PROTECT_PROM=1: don't forward response_time series to Prometheus
+	$(MAKE) _alloy CONFIG=agent/config$(if $(PROTECT_PROM),-protect).alloy
 
-agent-constrained: ## Agent profile "constrained": 250m CPU / 384Mi + memory_limiter -> back pressure on the app
-	$(MAKE) _alloy CONFIG=agent/config-constrained.alloy VALUES_EXTRA="-f agent/values-constrained.yaml"
+agent-constrained: ## Agent profile "constrained": 250m CPU / 384Mi + memory_limiter -> back pressure. PROTECT_PROM=1 as above
+	$(MAKE) _alloy CONFIG=agent/config-constrained$(if $(PROTECT_PROM),-protect).alloy VALUES_EXTRA="-f agent/values-constrained.yaml"
 
 _alloy:
 	helm repo add grafana https://grafana.github.io/helm-charts --force-update

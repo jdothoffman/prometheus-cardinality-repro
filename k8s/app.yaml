@@ -31,7 +31,9 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - { name: APP_ROLE, value: api }
             - { name: CARDINALITY_MODE, value: bounded }
-            - { name: CPU_WORK_ITERATIONS, value: "50" }
+            # ≈1.7 ms CPU per request → 4 replicas × 1 core ≈ 2,350 req/s capacity (the hypothesis presets'
+            # default). Change it here (not with kubectl set env): `make app` re-applies this manifest.
+            - { name: CPU_WORK_ITERATIONS, value: "1000" }
             - { name: VIRTUAL_PODS, value: "50" }
             - { name: POD_CHURN_SECONDS, value: "0" }
             - { name: OTEL_CARDINALITY_LIMIT, value: "200000" }
@@ -112,6 +114,57 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: transactions-driver-evidence
+subjects:
+  - kind: ServiceAccount
+    name: transactions-driver
+    namespace: demo
+---
+# "Reset everything" / hypothesis presets: restart Alloy and reset Prometheus (only those objects).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: transactions-driver-reset
+  namespace: alloy
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [alloy]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: transactions-driver-reset
+  namespace: alloy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: transactions-driver-reset
+subjects:
+  - kind: ServiceAccount
+    name: transactions-driver
+    namespace: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: transactions-driver-reset
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    resourceNames: [prometheus-kps-prometheus-0]
+    verbs: [get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: transactions-driver-reset
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: transactions-driver-reset
 subjects:
   - kind: ServiceAccount
     name: transactions-driver
