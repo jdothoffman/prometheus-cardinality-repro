@@ -17,7 +17,7 @@ APP_NODES      := k3d-$(CLUSTER)-agent-0 k3d-$(CLUSTER)-agent-1
 
 .PHONY: help prereqs up monitoring agent app all ui load load-stop load-logs explode calm churn \
         unchurn reset-prometheus agent-down agent-up guard-agent unguard-agent fix-app unfix-app \
-        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports
+        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports agent-normal agent-constrained
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -56,10 +56,16 @@ profile-oom: ## Default profile: Prometheus capped at 1Gi (OOMKilled -> CrashLoo
 agent: ## Install Grafana Alloy on the agent pool (unguarded config)
 	$(MAKE) _alloy CONFIG=agent/config.alloy
 
+agent-normal: ## Agent profile "normal": 1Gi, no CPU limit, no memory_limiter (same as make agent)
+	$(MAKE) _alloy CONFIG=agent/config.alloy
+
+agent-constrained: ## Agent profile "constrained": 250m CPU / 384Mi + memory_limiter -> back pressure on the app
+	$(MAKE) _alloy CONFIG=agent/config-constrained.alloy VALUES_EXTRA="-f agent/values-constrained.yaml"
+
 _alloy:
 	helm repo add grafana https://grafana.github.io/helm-charts --force-update
 	$(H) upgrade --install alloy grafana/alloy --version $(ALLOY_VERSION) -n alloy --create-namespace \
-	  -f agent/values.yaml --set-file alloy.configMap.content=$(CONFIG) --wait --timeout 5m
+	  -f agent/values.yaml $(VALUES_EXTRA) --set-file alloy.configMap.content=$(CONFIG) --wait --timeout 5m
 	$(K) -n alloy rollout restart deploy/alloy
 	$(K) -n alloy rollout status deploy/alloy --timeout=120s
 

@@ -1,26 +1,32 @@
 // transactions-api role: handles HTTP transactions and records metrics with OpenTelemetry.
 // Metrics are aggregated IN MEMORY by the OTel SDK and pushed via OTLP on a schedule
 // (PeriodicExportingMetricReader, background thread) to a Grafana Alloy agent. The request path only
-// does an in-memory Counter.Add / Histogram.Record, so it never waits on the metrics pipeline.
+// does an in-memory Counter.Add / Histogram.Record, so it never waits on the metrics pipeline. But the
+// SDK state, the serialization of every export, and any retries all share this pod's CPU and heap with
+// the request handling: that is the contention this repro is about.
 //
-// Labels on http_transactions_total: consume_type, state, product, pod (+ response_time = the bug).
-// "pod" simulates ~200 pods: each real replica emits VIRTUAL_PODS pod names.
+// Labels on http_transactions_total (each can be switched on/off live, see LabelSet):
+//   consume_type, state, product, pod (~200 simulated), response_time (float as a LABEL = the bug,
+//   with configurable precision: 6 decimals ≈ unique per request ... 1 decimal ≈ one value).
 //
 // Configuration (environment variables):
-//   CARDINALITY_MODE        bounded | unbounded. Unbounded adds response_time (float) as a LABEL.
-//                           Also switchable at runtime: POST /admin/mode?value=unbounded
-//   VIRTUAL_PODS            simulated pod names per real replica                 (default 50)
-//   POD_CHURN_SECONDS       if >0, replace ~20% of pod names this often (rollouts) (default 0 = off)
-//   CPU_WORK_ITERATIONS     SHA-256 passes over 4KB per transaction (simulated CPU work, default 50)
-//   OTEL_CARDINALITY_LIMIT  max series per metric stream in the SDK (default 200000; SDK default 2000)
-//   OTEL_ALLOWED_TAGS       comma list; if set, transaction metrics keep only these tag keys (app fix)
-//   OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_PROTOCOL / OTEL_METRIC_EXPORT_INTERVAL
-//                           standard OTel SDK settings (set in the Deployment)
+//   CARDINALITY_MODE             bounded | unbounded: initial label set (unbounded = + response_time)
+//   VIRTUAL_PODS                 simulated pod names per real replica                 (default 50)
+//   POD_CHURN_SECONDS            if >0, replace ~20% of pod names this often (rollouts) (default 0 = off)
+//   CPU_WORK_ITERATIONS          SHA-256 passes over 4KB per transaction (simulated CPU, default 50)
+//   OTEL_CARDINALITY_LIMIT       max series per metric stream in the SDK (default 200000; SDK default 2000)
+//   OTEL_CARDINALITY_LIMIT_SCOPE transactions (default): limit applies to http.transactions only
+//                                all: limit applies to every instrument. The SDK pre-allocates storage
+//                                sized by the limit per stream, so "all" reserves most of the heap.
+//   OTEL_ALLOWED_TAGS            comma list; if set, transaction metrics keep only these tag keys (app fix)
+//   OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_METRIC_EXPORT_INTERVAL / OTEL_METRIC_EXPORT_TIMEOUT
 
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Security.Cryptography;
+using OpenTelemetry;
+using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 
@@ -30,11 +36,18 @@ static class Api
     {
         var cfg = builder.Configuration;
         var cardinalityLimit = cfg.GetValue("OTEL_CARDINALITY_LIMIT", 200_000);
+        var limitAll = string.Equals(cfg["OTEL_CARDINALITY_LIMIT_SCOPE"], "all", StringComparison.OrdinalIgnoreCase);
         var allowedTags = (cfg["OTEL_ALLOWED_TAGS"] ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var realPodName = cfg["POD_NAME"] ?? Environment.MachineName;
+        var endpoint = (cfg["OTEL_EXPORTER_OTLP_ENDPOINT"] ?? "http://localhost:4318").TrimEnd('/');
+        var intervalMs = cfg.GetValue("OTEL_METRIC_EXPORT_INTERVAL", 10_000);
+        var timeoutMs = cfg.GetValue("OTEL_METRIC_EXPORT_TIMEOUT", 8_000);
 
-        builder.Services.AddSingleton(new CardinalityMode(cfg["CARDINALITY_MODE"] ?? "bounded"));
+        var labels = new LabelSet(cfg["CARDINALITY_MODE"] ?? "bounded");
+        var exportStats = new ExportStats(intervalMs, timeoutMs);
+        builder.Services.AddSingleton(labels);
+        builder.Services.AddSingleton(exportStats);
         builder.Services.AddSingleton(new VirtualPods(
             realPodName,
             cfg.GetValue("VIRTUAL_PODS", 50),
@@ -44,43 +57,65 @@ static class Api
 
         builder.Services.AddOpenTelemetry()
             .ConfigureResource(r => r.AddService("transactions-api", serviceInstanceId: realPodName))
-            .WithMetrics(metrics => metrics
-                .AddMeter(TransactionMetrics.MeterName)
-                .AddAspNetCoreInstrumentation()
-                .AddRuntimeInstrumentation()
-                .AddView(instrument =>
-                {
-                    MetricStreamConfiguration config = instrument.Name == TransactionMetrics.DurationName
-                        ? new ExplicitBucketHistogramConfiguration
-                        {
-                            Boundaries = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
-                        }
-                        : new MetricStreamConfiguration();
-
-                    config.CardinalityLimit = cardinalityLimit;
-                    if (instrument.Meter.Name == TransactionMetrics.MeterName && allowedTags.Length > 0)
+            .WithMetrics(metrics =>
+            {
+                metrics
+                    .AddMeter(TransactionMetrics.MeterName)
+                    .AddAspNetCoreInstrumentation()
+                    .AddRuntimeInstrumentation()
+                    .AddView(instrument =>
                     {
-                        config.TagKeys = allowedTags;
-                    }
-                    return config;
-                })
-                // Endpoint, protocol and interval come from OTEL_* env vars. Cumulative temporality (the
-                // default) means every series ever seen is kept in memory and re-sent on every export.
-                .AddOtlpExporter());
+                        MetricStreamConfiguration config = instrument.Name == TransactionMetrics.DurationName
+                            ? new ExplicitBucketHistogramConfiguration
+                            {
+                                Boundaries = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+                            }
+                            : new MetricStreamConfiguration();
+
+                        if (limitAll || instrument.Name == TransactionMetrics.TransactionsName)
+                        {
+                            config.CardinalityLimit = cardinalityLimit;
+                        }
+                        if (instrument.Meter.Name == TransactionMetrics.MeterName && allowedTags.Length > 0)
+                        {
+                            config.TagKeys = allowedTags;
+                        }
+                        return config;
+                    });
+
+                // OTLP/HTTP exporter, wrapped so every export (serialize + send + retries) is measured, and
+                // with an HttpClient whose handler records bytes, status codes and retry attempts.
+                // Cumulative temporality (the default): every series ever seen is kept in memory and
+                // re-sent on every export, so the export cost grows with cardinality.
+                var otlp = new OtlpMetricExporter(new OtlpExporterOptions
+                {
+                    Endpoint = new Uri(endpoint + "/v1/metrics"),
+                    Protocol = OtlpExportProtocol.HttpProtobuf,
+                    TimeoutMilliseconds = timeoutMs,
+                    HttpClientFactory = () => new HttpClient(new ExportHttpHandler(exportStats) { InnerHandler = new HttpClientHandler() })
+                    {
+                        Timeout = TimeSpan.FromMilliseconds(timeoutMs),
+                    },
+                });
+                metrics.AddReader(new PeriodicExportingMetricReader(new MeasuredExporter(otlp, exportStats), intervalMs, timeoutMs)
+                {
+                    TemporalityPreference = MetricReaderTemporalityPreference.Cumulative,
+                });
+            });
     }
 
     public static void Map(WebApplication app)
     {
         var cfg = app.Configuration;
         var cpuIterations = cfg.GetValue("CPU_WORK_ITERATIONS", 50);
-        var mode = app.Services.GetRequiredService<CardinalityMode>();
+        var labels = app.Services.GetRequiredService<LabelSet>();
         _ = app.Services.GetRequiredService<TransactionMetrics>(); // create instruments eagerly
 
         app.Logger.LogInformation(
-            "transactions-api {Pod}: CARDINALITY_MODE={Mode} VIRTUAL_PODS={Virtual} OTEL_CARDINALITY_LIMIT={Limit} OTEL_ALLOWED_TAGS={Tags} CPU_WORK_ITERATIONS={Cpu} OTLP={Endpoint}",
-            cfg["POD_NAME"] ?? Environment.MachineName, mode.Current, cfg.GetValue("VIRTUAL_PODS", 50),
-            cfg.GetValue("OTEL_CARDINALITY_LIMIT", 200_000), cfg["OTEL_ALLOWED_TAGS"] ?? "(all)", cpuIterations,
-            cfg["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+            "transactions-api {Pod}: labels={Labels} VIRTUAL_PODS={Virtual} OTEL_CARDINALITY_LIMIT={Limit} scope={Scope} OTEL_ALLOWED_TAGS={Tags} CPU_WORK_ITERATIONS={Cpu} OTLP={Endpoint}",
+            cfg["POD_NAME"] ?? Environment.MachineName, labels.Describe(), cfg.GetValue("VIRTUAL_PODS", 50),
+            cfg.GetValue("OTEL_CARDINALITY_LIMIT", 200_000), cfg["OTEL_CARDINALITY_LIMIT_SCOPE"] ?? "transactions",
+            cfg["OTEL_ALLOWED_TAGS"] ?? "(all)", cpuIterations, cfg["OTEL_EXPORTER_OTLP_ENDPOINT"]);
 
         app.MapGet("/", () => Results.Content(
             """
@@ -92,16 +127,25 @@ static class Api
             <b>transactions-driver</b> Deployment: run <code>make ui</code> and open
             <a href="http://localhost:8080">http://localhost:8080</a>.</p>
             <p>Endpoints: <code>POST /api/transactions</code>, <code>GET /admin/stats</code>,
-            <code>GET|POST /admin/mode</code>, <code>GET /healthz</code>.</p></body></html>
+            <code>GET|POST /admin/labels</code>, <code>GET|POST /admin/mode</code>, <code>GET /healthz</code>.</p></body></html>
             """, "text/html"));
 
         app.MapGet("/healthz", () => Results.Ok("ok"));
 
-        app.MapGet("/admin/mode", (CardinalityMode m) => Results.Ok(new { mode = m.Current }));
-        app.MapPost("/admin/mode", (string value, CardinalityMode m) =>
+        // Legacy two-state switch: bounded | unbounded (= all labels incl. response_time at 6 decimals).
+        app.MapGet("/admin/mode", (LabelSet l) => Results.Ok(new { mode = l.Mode, labels = l.Enabled, rtDecimals = l.ResponseTimeDecimals }));
+        app.MapPost("/admin/mode", (string value, LabelSet l) =>
         {
-            m.Set(value);
-            return Results.Ok(new { mode = m.Current });
+            l.SetMode(value);
+            return Results.Ok(new { mode = l.Mode, labels = l.Enabled });
+        });
+
+        // Fine-grained label control: which labels are recorded, and response_time precision.
+        app.MapGet("/admin/labels", (LabelSet l) => Results.Ok(l.ToConfig()));
+        app.MapPost("/admin/labels", (LabelConfig config, LabelSet l) =>
+        {
+            l.Set(config);
+            return Results.Ok(l.ToConfig());
         });
 
         app.MapGet("/admin/stats", (ReplicaStats stats) => Results.Json(stats.Snapshot()));
@@ -171,16 +215,45 @@ static class Transactions
     }
 }
 
-sealed class CardinalityMode(string initial)
+sealed record LabelConfig(string[]? Labels = null, int? ResponseTimeDecimals = null);
+
+// Which labels http_transactions_total carries, switchable at runtime. Removing a label only affects new
+// measurements: series the SDK already created stay in memory (cumulative) until the process restarts.
+sealed class LabelSet
 {
-    private volatile bool _unbounded = Parse(initial);
+    public static readonly string[] All = ["consume_type", "state", "product", "pod", "response_time"];
+    public static readonly string[] Bounded = ["consume_type", "state", "product", "pod"];
 
-    public bool IsUnbounded => _unbounded;
-    public string Current => _unbounded ? "unbounded" : "bounded";
-    public void Set(string value) => _unbounded = Parse(value);
+    private volatile string[] _enabled;
+    private volatile int _rtDecimals = 6;
 
-    private static bool Parse(string value) =>
-        string.Equals(value?.Trim(), "unbounded", StringComparison.OrdinalIgnoreCase);
+    public LabelSet(string initialMode) => _enabled = ModeLabels(initialMode);
+
+    public string[] Enabled => _enabled;
+    public int ResponseTimeDecimals => _rtDecimals;
+    public bool Has(string label) => Array.IndexOf(_enabled, label) >= 0;
+    public bool IsUnbounded => Has("response_time");
+    public string Mode => IsUnbounded ? "unbounded" : "bounded";
+    public string Key => string.Join(",", _enabled) + (IsUnbounded ? $"@{_rtDecimals}" : "");
+
+    public string Describe() => string.Join(", ", _enabled.Select(l => l == "response_time" ? $"response_time({_rtDecimals}dp)" : l));
+
+    public LabelConfig ToConfig() => new(_enabled, _rtDecimals);
+
+    public void SetMode(string mode)
+    {
+        _rtDecimals = 6;
+        _enabled = ModeLabels(mode);
+    }
+
+    public void Set(LabelConfig c)
+    {
+        if (c.ResponseTimeDecimals is { } d) _rtDecimals = Math.Clamp(d, 0, 6);
+        if (c.Labels is { } labels) _enabled = All.Where(l => labels.Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray();
+    }
+
+    private static string[] ModeLabels(string mode) =>
+        string.Equals(mode?.Trim(), "unbounded", StringComparison.OrdinalIgnoreCase) ? All : Bounded;
 }
 
 // Simulates many pods behind few real replicas. Names look like real ReplicaSet pods:
@@ -223,65 +296,209 @@ sealed class VirtualPods
 sealed class TransactionMetrics
 {
     public const string MeterName = "Transactions.Api";
+    public const string TransactionsName = "http.transactions";
     public const string DurationName = "http.transaction.duration";
 
-    private readonly CardinalityMode _mode;
+    private readonly LabelSet _labels;
     private readonly VirtualPods _pods;
     private readonly Counter<long> _transactions;
     private readonly Histogram<double> _duration;
 
-    public TransactionMetrics(IMeterFactory meterFactory, CardinalityMode mode, VirtualPods pods)
+    public TransactionMetrics(IMeterFactory meterFactory, LabelSet labels, VirtualPods pods, ExportStats export)
     {
-        _mode = mode;
+        _labels = labels;
         _pods = pods;
         var meter = meterFactory.Create(MeterName);
         // -> http_transactions_total, http_transaction_duration_seconds_*, transactions_cardinality_unbounded
-        _transactions = meter.CreateCounter<long>("http.transactions", description: "HTTP transactions processed");
+        _transactions = meter.CreateCounter<long>(TransactionsName, description: "HTTP transactions processed");
         _duration = meter.CreateHistogram<double>(DurationName, unit: "s", description: "Transaction response time");
-        meter.CreateObservableGauge("transactions.cardinality.unbounded", () => _mode.IsUnbounded ? 1 : 0,
+        meter.CreateObservableGauge("transactions.cardinality.unbounded", () => _labels.IsUnbounded ? 1 : 0,
             description: "1 when response_time is being emitted as a label");
         meter.CreateObservableGauge("transactions.virtual.pods", () => _pods.Count,
             description: "Simulated pod names emitted by this replica");
-    }
 
-    public bool IsUnbounded => _mode.IsUnbounded;
+        // The exporter's own cost, reported through the same pipeline (so it has gaps when that breaks;
+        // the driver also polls these directly from /admin/stats).
+        meter.CreateObservableGauge("otlp.export.last.duration", () => export.LastExportMs / 1000.0, unit: "s",
+            description: "Duration of the last OTLP export (serialize + send + retries)");
+        meter.CreateObservableGauge("otlp.export.last.points", () => export.LastPoints,
+            description: "Metric points in the last OTLP export");
+        meter.CreateObservableGauge("otlp.export.last.bytes", () => export.LastBytes, unit: "By",
+            description: "Request body size of the last OTLP HTTP request");
+        meter.CreateObservableCounter("otlp.export.failures", () => export.Failures,
+            description: "OTLP exports that did not succeed");
+        meter.CreateObservableCounter("otlp.export.http.retries", () => export.HttpRetries,
+            description: "OTLP HTTP requests beyond the first per export (retries after 429/5xx/timeouts)");
+    }
 
     public void Record(string consumeType, string state, string product, TimeSpan elapsed)
     {
-        var tags = new TagList
-        {
-            { "consume_type", consumeType },
-            { "state", state },
-            { "product", product },
-            { "pod", _pods.Pick() },
-        };
-
         // Response time as a proper value: bounded histogram (pod comes from the resource/instance).
         _duration.Record(elapsed.TotalSeconds,
             new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } });
 
-        // THE BUG: response time as a float LABEL. Nearly every request creates a brand-new series.
-        if (_mode.IsUnbounded)
+        var l = _labels;
+        var tags = new TagList();
+        if (l.Has("consume_type")) tags.Add("consume_type", consumeType);
+        if (l.Has("state")) tags.Add("state", state);
+        if (l.Has("product")) tags.Add("product", product);
+        if (l.Has("pod")) tags.Add("pod", _pods.Pick());
+        // THE BUG: response time as a float LABEL. At 6 decimals nearly every request creates a new series;
+        // lowering the precision buckets it (3 dp ≈ 1ms buckets, 2 dp ≈ 10ms, 1 dp ≈ 100ms).
+        if (l.IsUnbounded)
         {
-            tags.Add("response_time", elapsed.TotalSeconds.ToString("F6", CultureInfo.InvariantCulture));
+            var d = l.ResponseTimeDecimals;
+            tags.Add("response_time", Math.Round(elapsed.TotalSeconds, d).ToString("F" + d, CultureInfo.InvariantCulture));
         }
         _transactions.Add(1, tags);
     }
 }
 
+// Cost of the metrics pipeline as seen from inside the app: duration of each export (on the exporter's
+// background thread, but on this pod's CPU), points per export, bytes and status per HTTP attempt.
+sealed class ExportStats(int intervalMs, int timeoutMs)
+{
+    private readonly Lock _lock = new();
+    private long _exports, _failures, _httpRequests, _httpFailures, _httpRetries, _totalExportMicros;
+    private double _lastExportMs, _maxExportMsSinceRead;
+    private long _lastPoints, _lastBytes, _lastSuccessUnixMs;
+    private int _attemptsThisExport;
+
+    public int IntervalMs => intervalMs;
+    public int TimeoutMs => timeoutMs;
+    public double LastExportMs { get { lock (_lock) return _lastExportMs; } }
+    public long LastPoints => Interlocked.Read(ref _lastPoints);
+    public long LastBytes => Interlocked.Read(ref _lastBytes);
+    public long Failures => Interlocked.Read(ref _failures);
+    public long HttpRetries => Interlocked.Read(ref _httpRetries);
+
+    public void OnExportStart() => Interlocked.Exchange(ref _attemptsThisExport, 0);
+
+    public void OnExport(TimeSpan elapsed, long points, bool ok)
+    {
+        lock (_lock)
+        {
+            _exports++;
+            if (!ok) _failures++;
+            else _lastSuccessUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _lastExportMs = elapsed.TotalMilliseconds;
+            _maxExportMsSinceRead = Math.Max(_maxExportMsSinceRead, _lastExportMs);
+            _totalExportMicros += (long)(elapsed.TotalMilliseconds * 1000);
+            _lastPoints = points;
+        }
+    }
+
+    public void OnHttpAttempt(long bytes, bool ok)
+    {
+        lock (_lock)
+        {
+            _httpRequests++;
+            if (!ok) _httpFailures++;
+            if (Interlocked.Increment(ref _attemptsThisExport) > 1) _httpRetries++;
+            if (bytes > 0) _lastBytes = bytes;
+        }
+    }
+
+    public (long Exports, long Failures, long HttpRequests, long HttpFailures, long HttpRetries, double TotalExportMs,
+        double LastExportMs, double MaxExportMsSinceRead, long LastPoints, long LastBytes, long LastSuccessUnixMs) ReadAndReset()
+    {
+        lock (_lock)
+        {
+            var r = (_exports, _failures, _httpRequests, _httpFailures, _httpRetries, _totalExportMicros / 1000.0,
+                _lastExportMs, _maxExportMsSinceRead, _lastPoints, _lastBytes, _lastSuccessUnixMs);
+            _maxExportMsSinceRead = 0;
+            return r;
+        }
+    }
+}
+
+sealed class MeasuredExporter(BaseExporter<Metric> inner, ExportStats stats) : BaseExporter<Metric>
+{
+    // The SDK sets ParentProvider only on the exporter attached to the reader (this wrapper). The OTLP
+    // exporter reads the Resource (service.name -> job, service.instance.id -> instance) from its own
+    // ParentProvider, so pass it through; its setter is internal in OpenTelemetry 1.21.
+    private static readonly System.Reflection.MethodInfo? SetParent =
+        typeof(BaseExporter<Metric>).GetProperty(nameof(ParentProvider))?.GetSetMethod(nonPublic: true);
+    private bool _parentSet;
+
+    public override ExportResult Export(in Batch<Metric> batch)
+    {
+        if (!_parentSet && ParentProvider is not null)
+        {
+            SetParent?.Invoke(inner, [ParentProvider]);
+            _parentSet = true;
+        }
+        long points = 0;
+        foreach (var metric in batch)
+        {
+            foreach (ref readonly var _ in metric.GetMetricPoints()) points++;
+        }
+        stats.OnExportStart();
+        var sw = Stopwatch.StartNew();
+        var result = ExportResult.Failure;
+        try { result = inner.Export(batch); }
+        finally { stats.OnExport(sw.Elapsed, points, result == ExportResult.Success); }
+        return result;
+    }
+
+    protected override bool OnForceFlush(int timeoutMilliseconds) => inner.ForceFlush(timeoutMilliseconds);
+    protected override bool OnShutdown(int timeoutMilliseconds) => inner.Shutdown(timeoutMilliseconds);
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) inner.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
+sealed class ExportHttpHandler(ExportStats stats) : DelegatingHandler
+{
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        var bytes = request.Content?.Headers.ContentLength ?? 0;
+        try
+        {
+            var resp = await base.SendAsync(request, ct);
+            stats.OnHttpAttempt(bytes, resp.IsSuccessStatusCode);
+            return resp;
+        }
+        catch
+        {
+            stats.OnHttpAttempt(bytes, false);
+            throw;
+        }
+    }
+
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken ct)
+    {
+        var bytes = request.Content?.Headers.ContentLength ?? 0;
+        try
+        {
+            var resp = base.Send(request, ct);
+            stats.OnHttpAttempt(bytes, resp.IsSuccessStatusCode);
+            return resp;
+        }
+        catch
+        {
+            stats.OnHttpAttempt(bytes, false);
+            throw;
+        }
+    }
+}
+
 // Point-in-time resource stats for this replica, read by the driver (GET /admin/stats).
 // Reads cgroup v2 files so the numbers match what the kubelet / OOM killer see.
-sealed class ReplicaStats(CardinalityMode mode, VirtualPods pods, IConfiguration cfg)
+sealed class ReplicaStats(LabelSet labels, VirtualPods pods, ExportStats export, IConfiguration cfg)
 {
     private readonly long _startedMs = Environment.TickCount64;
     private readonly string _pod = cfg["POD_NAME"] ?? Environment.MachineName;
     private readonly int _cardinalityLimit = cfg.GetValue("OTEL_CARDINALITY_LIMIT", 200_000);
+    private readonly string _limitScope = cfg["OTEL_CARDINALITY_LIMIT_SCOPE"] ?? "transactions";
     private long _transactions, _unboundedRecords, _cancelled;
 
     public void OnTransaction(bool cancelled)
     {
         Interlocked.Increment(ref _transactions);
-        if (mode.IsUnbounded) Interlocked.Increment(ref _unboundedRecords);
+        if (labels.IsUnbounded) Interlocked.Increment(ref _unboundedRecords);
         if (cancelled) Interlocked.Increment(ref _cancelled);
     }
 
@@ -289,10 +506,14 @@ sealed class ReplicaStats(CardinalityMode mode, VirtualPods pods, IConfiguration
     {
         var gc = GC.GetGCMemoryInfo();
         var cpu = ReadKeyValues("/sys/fs/cgroup/cpu.stat");
+        var ex = export.ReadAndReset();
         return new ReplicaSnapshot
         {
             Pod = _pod,
-            Mode = mode.Current,
+            Mode = labels.Mode,
+            Labels = labels.Enabled,
+            ResponseTimeDecimals = labels.ResponseTimeDecimals,
+            LabelKey = labels.Key,
             SampledAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             UptimeSeconds = (Environment.TickCount64 - _startedMs) / 1000.0,
             MemoryCurrentBytes = ReadLong("/sys/fs/cgroup/memory.current") ?? Environment.WorkingSet,
@@ -316,7 +537,21 @@ sealed class ReplicaStats(CardinalityMode mode, VirtualPods pods, IConfiguration
             UnboundedRecords = Interlocked.Read(ref _unboundedRecords),
             Cancelled = Interlocked.Read(ref _cancelled),
             CardinalityLimit = _cardinalityLimit,
+            CardinalityLimitScope = _limitScope,
             VirtualPods = pods.Count,
+            ExportIntervalMs = export.IntervalMs,
+            ExportTimeoutMs = export.TimeoutMs,
+            Exports = ex.Exports,
+            ExportFailures = ex.Failures,
+            ExportTotalMs = ex.TotalExportMs,
+            ExportLastMs = ex.LastExportMs,
+            ExportMaxMsSinceLastRead = ex.MaxExportMsSinceRead,
+            ExportLastPoints = ex.LastPoints,
+            ExportLastBytes = ex.LastBytes,
+            ExportHttpRequests = ex.HttpRequests,
+            ExportHttpFailures = ex.HttpFailures,
+            ExportHttpRetries = ex.HttpRetries,
+            ExportLastSuccessUnixMs = ex.LastSuccessUnixMs,
         };
     }
 
@@ -356,6 +591,9 @@ sealed class ReplicaSnapshot
 {
     public string Pod { get; set; } = "";
     public string Mode { get; set; } = "";
+    public string[] Labels { get; set; } = [];
+    public int ResponseTimeDecimals { get; set; }
+    public string LabelKey { get; set; } = "";
     public long SampledAtUnixMs { get; set; }
     public double UptimeSeconds { get; set; }
     public long MemoryCurrentBytes { get; set; }
@@ -376,5 +614,19 @@ sealed class ReplicaSnapshot
     public long UnboundedRecords { get; set; }
     public long Cancelled { get; set; }
     public int CardinalityLimit { get; set; }
+    public string CardinalityLimitScope { get; set; } = "";
     public int VirtualPods { get; set; }
+    public int ExportIntervalMs { get; set; }
+    public int ExportTimeoutMs { get; set; }
+    public long Exports { get; set; }
+    public long ExportFailures { get; set; }
+    public double ExportTotalMs { get; set; }
+    public double ExportLastMs { get; set; }
+    public double ExportMaxMsSinceLastRead { get; set; }
+    public long ExportLastPoints { get; set; }
+    public long ExportLastBytes { get; set; }
+    public long ExportHttpRequests { get; set; }
+    public long ExportHttpFailures { get; set; }
+    public long ExportHttpRetries { get; set; }
+    public long ExportLastSuccessUnixMs { get; set; }
 }
