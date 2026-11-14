@@ -26,6 +26,9 @@ static class Driver
         builder.Services.AddHostedService(sp => sp.GetRequiredService<ReplicaMonitor>());
         builder.Services.AddSingleton<PipelineMonitor>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<PipelineMonitor>());
+        builder.Services.AddSingleton<RunStore>();
+        builder.Services.AddSingleton<KubeClient>();
+        builder.Services.AddSingleton<EvidenceCollector>();
         builder.Services.AddSingleton<LoadTest>();
     }
 
@@ -43,6 +46,18 @@ static class Driver
         {
             test.Stop("stopped by user");
             return Results.Ok(new { stopping = true });
+        });
+
+        app.MapGet("/api/runs", (RunStore store) => Results.Json(store.Summaries()));
+
+        // Self-contained HTML report for a run. ?download=1 saves it as a file.
+        app.MapGet("/api/runs/{id}/report", (string id, bool? download, RunStore store) =>
+        {
+            var path = store.ReportPath(id);
+            if (path is null) return Results.NotFound(new { error = "no report for that run" });
+            return download == true
+                ? Results.File(path, "text/html; charset=utf-8", $"{id}.html")
+                : Results.File(path, "text/html; charset=utf-8");
         });
 
         app.MapPost("/api/test/dryrun", (TestConfig config, LoadTest test) =>
@@ -77,7 +92,9 @@ sealed record TestConfig(
     int DegradedP95Ms = 1000,
     double StopErrorPct = 50,
     int MaxInFlight = 6000,
-    bool DryRun = false);
+    bool DryRun = false,
+    string? Name = null,
+    string? Notes = null);
 
 // Dry run: a short, safe pass (bounded labels, low rate, strict auto-stop) that exercises every hop
 // and then checks the pipeline end to end, without pushing anything toward a crash.
@@ -98,9 +115,6 @@ sealed record StepResult(int Rate, long StartT, long EndT, int Ok, int Failed, d
 
 sealed record Milestone(long T, int Rate, string What);
 
-sealed record RunSummary(string StartedAt, string Mode, long DurationSeconds, int MaxTargetRate, int PeakOkPerSec,
-    Milestone? Degraded, Milestone? FirstTimeout, Milestone? Errors5, Milestone? Errors50, string? StopReason, TestConfig Config);
-
 sealed class Bucket
 {
     public int Target, Sent, Ok, Timeouts, HttpErrors, ConnErrors, Dropped;
@@ -119,8 +133,11 @@ sealed class LoadTest
     private readonly ConcurrentDictionary<long, Bucket> _buckets = new();
     private readonly List<Point> _points = [];
     private readonly List<StepResult> _steps = [];
-    private readonly List<RunSummary> _history = [];
+    private readonly RunStore _store;
+    private readonly EvidenceCollector _evidence;
     private readonly Lock _lock = new();
+    private string _name = "";
+    private string? _notes;
     private readonly Timer _finalizer;
 
     private CancellationTokenSource? _cts;
@@ -133,10 +150,13 @@ sealed class LoadTest
     private string _modeAtStart = "?";
     private Milestone? _degraded, _firstTimeout, _errors5, _errors50;
 
-    public LoadTest(IConfiguration cfg, ReplicaMonitor replicas, PipelineMonitor pipeline, ILogger<LoadTest> log)
+    public LoadTest(IConfiguration cfg, ReplicaMonitor replicas, PipelineMonitor pipeline, RunStore store,
+        EvidenceCollector evidence, ILogger<LoadTest> log)
     {
         _replicas = replicas;
         _pipeline = pipeline;
+        _store = store;
+        _evidence = evidence;
         _log = log;
         _target = (cfg["TARGET_URL"] ?? "http://localhost:8080").TrimEnd('/');
         _http = new HttpClient(new SocketsHttpHandler
@@ -177,6 +197,10 @@ sealed class LoadTest
             _checksForDryRun = _config.DryRun;
             _startedTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             _modeAtStart = _config.DryRun ? "bounded" : _replicas.DesiredMode ?? _replicas.ObservedMode;
+            var name = (c.Name ?? "").Trim();
+            _name = name.Length > 0 ? name[..Math.Min(80, name.Length)]
+                : _config.DryRun ? "Dry run" : $"{_modeAtStart} ramp {_config.StartRate}→{_config.MaxRate} req/s";
+            _notes = string.IsNullOrWhiteSpace(c.Notes) ? null : c.Notes.Trim()[..Math.Min(2000, c.Notes.Trim().Length)];
             _state = "running";
             _cts = new CancellationTokenSource();
             var config = _config;
@@ -279,21 +303,49 @@ sealed class LoadTest
             }
         }
 
+        // Report: let the pipeline catch up (OTLP every 10s + Alloy batch + scrape), then collect evidence
+        // while it is fresh. Kubernetes events expire and crashed containers' logs vanish on next restart.
+        _state = "reporting";
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(cfg.DryRun ? 5 : 25));
+            var record = BuildRecord(cfg);
+            record.Evidence = await _evidence.CollectAsync(record, _replicas.Latest);
+            (record.Headline, record.Findings) = Analyzer.Analyze(record);
+            _store.Save(record, ReportRenderer.Render(record));
+            _log.LogInformation("Report saved: {Id} — {Headline}", record.Id, record.Headline);
+        }
+        catch (Exception ex) { _log.LogError(ex, "Report generation failed"); }
+
+        lock (_lock) _state = "idle";
+        _log.LogInformation("Load test finished: {Reason}", _stopReason);
+    }
+
+    private RunRecord BuildRecord(TestConfig cfg)
+    {
+        List<Point> pts;
+        lock (_points) pts = [.. _points];
         lock (_lock)
         {
-            List<Point> pts;
-            lock (_points) pts = [.. _points];
-            _history.Insert(0, new RunSummary(
-                DateTimeOffset.FromUnixTimeSeconds(_startedTs).ToString("u", CultureInfo.InvariantCulture),
-                cfg.DryRun ? $"dry run ({_checks.Count(c => c.Ok)}/{_checks.Count} checks)" : _modeAtStart,
-                pts.Count == 0 ? 0 : pts[^1].T,
-                pts.Count == 0 ? 0 : pts.Max(p => p.Target),
-                pts.Count == 0 ? 0 : pts.Max(p => p.Ok),
-                _degraded, _firstTimeout, _errors5, _errors50, _stopReason, cfg));
-            if (_history.Count > 20) _history.RemoveAt(_history.Count - 1);
-            _state = "idle";
+            return new RunRecord
+            {
+                Id = RunStore.MakeId(_startedTs, _name),
+                Name = _name,
+                Notes = _notes,
+                Mode = _modeAtStart,
+                DryRun = cfg.DryRun,
+                Config = cfg,
+                StartedAtUnix = _startedTs,
+                EndedAtUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                StopReason = _stopReason,
+                Milestones = new() { ["degraded"] = _degraded, ["firstTimeout"] = _firstTimeout, ["errors5"] = _errors5, ["errors50"] = _errors50 },
+                Steps = [.. _steps],
+                Points = pts,
+                Checks = [.. _checks],
+                ReplicaSamples = _replicas.HistorySince(_startedTs - 10),
+                PipelineSamples = _pipeline.HistorySince(_startedTs - 10),
+            };
         }
-        _log.LogInformation("Load test finished: {Reason}", _stopReason);
     }
 
     private async Task<List<Check>> RunChecksAsync(TestConfig cfg)
@@ -441,7 +493,9 @@ sealed class LoadTest
                 },
                 milestones = new { degraded = _degraded, firstTimeout = _firstTimeout, errors5 = _errors5, errors50 = _errors50 },
                 steps = _steps.ToList(),
-                history = _history.ToList(),
+                name = _name,
+                notes = _notes,
+                history = _store.Summaries().Take(25).ToList(),
                 pointsFrom = Math.Max(0, since),
                 points = pts,
             };
@@ -461,7 +515,8 @@ sealed class ReplicaView
     public long LastSeenUnix { get; set; }
 }
 
-sealed record ReplicaSample(long Ts, string Pod, long MemoryBytes, double? CpuCores, double? ThrottledPct, bool Reachable);
+sealed record ReplicaSample(long Ts, string Pod, long MemoryBytes, double? CpuCores, double? ThrottledPct, bool Reachable,
+    long? GcHeapBytes = null, long? GcHeapLimitBytes = null);
 
 // Polls every api replica directly (headless Service DNS) every 2s. Works even when Prometheus is down.
 sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : BackgroundService
@@ -535,7 +590,8 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
         {
             foreach (var v in _views.Values)
                 _history.Add(new ReplicaSample(now, v.Stats?.Pod ?? v.Ip, v.Reachable ? v.Stats?.MemoryCurrentBytes ?? 0 : 0,
-                    v.Reachable ? v.CpuCores : null, v.Reachable ? v.ThrottledPct : null, v.Reachable));
+                    v.Reachable ? v.CpuCores : null, v.Reachable ? v.ThrottledPct : null, v.Reachable,
+                    v.Reachable ? v.Stats?.GcHeapBytes : null, v.Stats?.GcHeapLimitBytes));
             if (_history.Count > 20_000) _history.RemoveRange(0, _history.Count - 20_000);
         }
     }

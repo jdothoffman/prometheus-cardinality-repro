@@ -8,3 +8,5 @@ obj/
 # OS / editor
 .DS_Store
 *.swp
+# Load-test reports copied from the driver (make reports)
+reports/
