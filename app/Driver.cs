@@ -68,6 +68,10 @@ static class Driver
         app.MapPost("/api/reset", (LabelConfig? labels, LoadTest test, ReplicaMonitor replicas) =>
             test.Prepare(null, labels ?? replicas.CurrentLabels) ? Results.Ok(new { preparing = true }) : Results.Conflict(new { error = "a test is already running or preparing" }));
 
+        // Re-run the analysis (findings, headline, report) of a stored run with the current rules.
+        app.MapPost("/api/runs/{id}/reanalyze", (string id, LoadTest test) =>
+            test.Reanalyze(id) is { } h ? Results.Ok(new { id, headline = h }) : Results.NotFound(new { error = "no such run" }));
+
         app.MapPost("/api/test/dryrun", (TestConfig config, LoadTest test) =>
             test.Start(DryRunPreset.Apply(config)) ? Results.Ok(new { started = true }) : Results.Conflict(new { error = "a test is already running" }));
 
@@ -442,7 +446,7 @@ sealed class LoadTest
             await Task.Delay(TimeSpan.FromSeconds(cfg.DryRun ? 5 : 25));
             var record = BuildRecord(cfg);
             record.Evidence = await _evidence.CollectAsync(record, _replicas.Latest);
-            (record.Headline, record.Findings) = Analyzer.Analyze(record);
+            (record.Headline, record.Findings) = Analyzer.Analyze(record, FindControl(record));
             _store.Save(record, ReportRenderer.Render(record));
             _log.LogInformation("Report saved: {Id} — {Headline}", record.Id, record.Headline);
         }
@@ -450,6 +454,27 @@ sealed class LoadTest
 
         lock (_lock) _state = "idle";
         _log.LogInformation("Load test finished: {Reason}", _stopReason);
+    }
+
+    public string? Reanalyze(string id)
+    {
+        var record = _store.Load(id);
+        if (record is null) return null;
+        (record.Headline, record.Findings) = Analyzer.Analyze(record, FindControl(record));
+        _store.Save(record, ReportRenderer.Render(record));
+        return record.Headline;
+    }
+
+    // The most recent bounded-label run at the same constant rate and duration on the same agent profile:
+    // the control a high-cardinality soak should be compared against.
+    private RunSummary? FindControl(RunRecord r)
+    {
+        if (!Labels.IsHighCardinality(new LabelConfig(r.Labels, r.ResponseTimeDecimals, r.Mode.Contains("GUID") ? 1 : 0, 0)) || r.Config.StartRate != r.Config.MaxRate)
+            return null;
+        return _store.Summaries().FirstOrDefault(s => !s.DryRun && s.Id != r.Id
+            && !s.Labels.Contains("response_time") && !s.Mode.Contains("GUID")
+            && s.MaxTargetRate == r.Config.MaxRate && Math.Abs(s.DurationSeconds - r.Config.StepSeconds) <= 15
+            && s.AgentProfile == r.AgentProfile);
     }
 
     private RunRecord BuildRecord(TestConfig cfg)
@@ -656,13 +681,16 @@ sealed class ReplicaView
     public long ExportFailuresTotal { get; set; }
     public long ExportRetriesTotal { get; set; }
     public double? SecondsSinceExportSuccess { get; set; }
+    // GC, derived between two polls: % of wall time the runtime was paused for GC, and gen2 collections.
+    public double? GcPausePct { get; set; }
+    public long Gen2Delta { get; set; }
     public ReplicaSnapshot? Stats { get; set; }
     public long LastSeenUnix { get; set; }
 }
 
 sealed record ReplicaSample(long Ts, string Pod, long MemoryBytes, double? CpuCores, double? ThrottledPct, bool Reachable,
     long? GcHeapBytes = null, long? GcHeapLimitBytes = null, double? ExportMaxMs = null, long? ExportPoints = null,
-    long? ExportBytes = null, long ExportFailures = 0, long ExportRetries = 0);
+    long? ExportBytes = null, long ExportFailures = 0, long ExportRetries = 0, double? GcPausePct = null, long Gen2 = 0);
 
 static class Labels
 {
@@ -782,7 +810,8 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
                     v.Reachable ? v.CpuCores : null, v.Reachable ? v.ThrottledPct : null, v.Reachable,
                     v.Reachable ? s?.GcHeapBytes : null, s?.GcHeapLimitBytes,
                     v.Reachable ? v.ExportMaxMs : null, v.Reachable ? s?.ExportLastPoints : null, v.Reachable ? s?.ExportLastBytes : null,
-                    v.Reachable ? v.ExportFailuresDelta : 0, v.Reachable ? v.ExportRetriesDelta : 0));
+                    v.Reachable ? v.ExportFailuresDelta : 0, v.Reachable ? v.ExportRetriesDelta : 0,
+                    v.Reachable ? v.GcPausePct : null, v.Reachable ? v.Gen2Delta : 0));
             }
             if (_history.Count > 20_000) _history.RemoveRange(0, _history.Count - 20_000);
         }
@@ -797,6 +826,7 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
                        ?? throw new InvalidOperationException("empty stats");
             var prev = view.Stats;
             view.ExportFailuresDelta = view.ExportRetriesDelta = 0;
+            view.Gen2Delta = 0;
             if (prev is not null && prev.Pod == snap.Pod && snap.UptimeSeconds >= prev.UptimeSeconds)
             {
                 var dt = (snap.SampledAtUnixMs - prev.SampledAtUnixMs) / 1000.0;
@@ -809,6 +839,8 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
                 var exports = snap.Exports - prev.Exports;
                 if (exports > 0) view.ExportAvgMs = Math.Round((snap.ExportTotalMs - prev.ExportTotalMs) / exports, 1);
                 view.ExportFailuresDelta = Math.Max(0, snap.ExportFailures - prev.ExportFailures);
+                if (dt > 0) view.GcPausePct = Math.Round(Math.Clamp(100 * (snap.GcTotalPauseMs - prev.GcTotalPauseMs) / 1000.0 / dt, 0, 100), 1);
+                view.Gen2Delta = Math.Max(0, snap.Gen2Collections - prev.Gen2Collections);
                 view.ExportRetriesDelta = Math.Max(0, snap.ExportHttpRetries - prev.ExportHttpRetries);
             }
             else if (prev is not null && prev.Pod == snap.Pod)

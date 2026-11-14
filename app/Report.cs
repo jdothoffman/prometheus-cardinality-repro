@@ -145,6 +145,13 @@ sealed class RunStore
         catch (Exception ex) { _log.LogWarning(ex, "Could not persist run {Id}", r.Id); }
     }
 
+    public RunRecord? Load(string id)
+    {
+        if (!Regex.IsMatch(id, "^[A-Za-z0-9._-]+$")) return null;
+        var p = Path.Combine(_runs, id + ".json");
+        return File.Exists(p) ? JsonSerializer.Deserialize<RunRecord>(File.ReadAllText(p), Json.Options) : null;
+    }
+
     public string? ReportPath(string id)
     {
         if (!Regex.IsMatch(id, "^[A-Za-z0-9._-]+$")) return null;
@@ -367,6 +374,31 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
             Note = "Retries follow 429/5xx (e.g. Alloy's memory_limiter refusing data) or timeouts; each retry re-sends the payload.",
             Series = pods.Select(p => new ChartSeries(Short(p), Series(p, s => s.ExportFailures + s.ExportRetries))).ToList(),
         });
+
+        ev.Charts.Add(new ChartSpec
+        {
+            Title = "GC pause per replica (% of wall time, direct polls)", Unit = "pct",
+            Note = "Time the .NET runtime was paused for garbage collection between two 2s polls. Polled from the pods, so it survives a broken metrics pipeline.",
+            Series = pods.Select(p => new ChartSeries(Short(p), Series(p, s => s.GcPausePct))).ToList(),
+        });
+        ev.Charts.Add(new ChartSpec
+        {
+            Title = "Gen2 (full) GC collections per replica, per 2s poll", Unit = "short",
+            Series = pods.Select(p => new ChartSeries(Short(p), Series(p, s => s.Gen2))).ToList(),
+        });
+        var gcp = during.Where(s => s.GcPausePct.HasValue).Select(s => s.GcPausePct!.Value).ToList();
+        ev.Facts["gcPausePeakPct"] = gcp.Count == 0 ? null : gcp.Max();
+        ev.Facts["gcPauseAvgPct"] = gcp.Count == 0 ? null : Math.Round(gcp.Average(), 2);
+        ev.Facts["gen2Total"] = during.Sum(s => s.Gen2);
+        var degr0 = r.Milestones.GetValueOrDefault("degraded") ?? r.Milestones.GetValueOrDefault("firstTimeout");
+        if (degr0 is not null)
+        {
+            var win = during.Where(s => s.Ts - t0 >= degr0.T - 15 && s.Ts - t0 <= degr0.T + 15).ToList();
+            var wp = win.Where(s => s.GcPausePct.HasValue).Select(s => s.GcPausePct!.Value).ToList();
+            ev.Facts["gcPauseAtDegradationPct"] = wp.Count == 0 ? null : wp.Max();
+            ev.Facts["gen2AtDegradation"] = win.Sum(s => s.Gen2);
+            ev.Facts["unreachableAtDegradation"] = win.Where(s => !s.Reachable).Select(s => s.Pod).Distinct().Count();
+        }
 
         // Facts for the verdict.
         var exportMax = during.Select(s => s.ExportMaxMs).Where(v => v.HasValue).Select(v => v!.Value).ToList();
@@ -699,7 +731,7 @@ static class Analyzer
     private static string Mib(double? b) => b is null ? "?" : $"{b.Value / 1048576:N0} MiB";
     private static string Pct(double? a, double? b) => a is null || b is null || b == 0 ? "?" : $"{100 * a.Value / b.Value:N0}%";
 
-    public static (string Headline, List<Finding> Findings) Analyze(RunRecord r)
+    public static (string Headline, List<Finding> Findings) Analyze(RunRecord r, RunSummary? control = null)
     {
         var f = new List<Finding>();
         var ev = r.Evidence;
@@ -836,7 +868,32 @@ static class Analyzer
                     $"throttling {N(thrE)}% → {N(thrL)}%, export {N(expE)} → {N(expL)} ms, p95 {N(p95E)} → {N(p95L)} ms, {failLate:N0} failures in the second half. ";
                 f.Add(new("info", "Soak: early vs late at constant load", soakEvidence));
 
-                if (latencyRose && exportRose && cpuRose && !earlySaturated && !masked)
+                // Control at the same rate, duration and agent profile with bounded labels.
+                var controlClean = control is not null && control.Degraded is null && control.FirstTimeout is null && control.Errors5 is null;
+                var controlText = control is null
+                    ? "No matching control run found (same rate, duration and agent, bounded labels): run one to rule out the environment. "
+                    : controlClean ? $"Control \"{control.Name}\" at the same rate/duration/agent had no degradation and no errors. "
+                    : $"Control \"{control.Name}\" also degraded, so the environment/load explains it, not the labels. ";
+                if (control is not null)
+                    f.Add(new(controlClean ? "info" : "warn", controlClean ? "Control run was clean" : "Control run also degraded", controlText));
+
+                // Transient stall: at constant load any degradation is suspect; the early/late comparison misses a
+                // stall that recovers (e.g. when the agent crashes and exports start failing fast).
+                var badSecs = r.Points.Where(p => p.P95 >= r.Config.DegradedP95Ms || p.Timeouts + p.HttpErrors + p.ConnErrors + p.Dropped > 0).ToList();
+                if (degraded && badSecs.Count > 0 && pressure && contention && precedes && !loadSaturated && !masked && (control is null || controlClean))
+                {
+                    var fails = badSecs.Sum(p => p.Timeouts + p.HttpErrors + p.ConnErrors + p.Dropped);
+                    var gcAt = fx.GetValueOrDefault("gcPauseAtDegradationPct");
+                    var unreach = fx.GetValueOrDefault("unreachableAtDegradation");
+                    f.Add(new("critical", "Metrics back pressure: CONFIRMED — transient outage at constant load",
+                        $"At a constant {r.Config.StartRate:N0} req/s the app degraded from t={degrMs!.T}s: {badSecs.Count} bad seconds between t={badSecs.First().T}s and t={badSecs.Last().T}s, " +
+                        $"worst p95 {badSecs.Max(p => p.P95):N0} ms, {fails:N0} failed requests" +
+                        (unreach is > 0 ? $", {unreach:N0} replica(s) unresponsive" : "") + ". " +
+                        $"Export pressure began first (t={onsetT:N0}s); request CPU alone would be ≈{N(projected, "N2")} of {N(cpuLimit, "N1")} cores (not load saturation); " +
+                        $"pod throttling peaked at {N(throttlePeak)}%" + (gcAt is not null ? $"; GC paused up to {gcAt:N0}% of wall time around the stall" : "") + ". " +
+                        controlText + evidence));
+                }
+                else if (latencyRose && exportRose && cpuRose && !earlySaturated && !masked && (control is null || controlClean))
                     f.Add(new("critical", "Metrics back pressure: CONFIRMED — at constant load, growing export cost took CPU from request handling",
                         soakEvidence + evidence));
                 else if (exportRose && (cpuRose || latencyRose))
