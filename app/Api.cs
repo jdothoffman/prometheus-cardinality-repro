@@ -298,6 +298,10 @@ sealed class ReplicaStats(CardinalityMode mode, VirtualPods pods, IConfiguration
             MemoryCurrentBytes = ReadLong("/sys/fs/cgroup/memory.current") ?? Environment.WorkingSet,
             MemoryLimitBytes = ReadLong("/sys/fs/cgroup/memory.max"),
             GcHeapBytes = gc.HeapSizeBytes,
+            GcCommittedBytes = gc.TotalCommittedBytes,
+            // In a container .NET sets a GC heap hard limit (default 75% of the memory limit). When the
+            // heap reaches it, allocations throw OutOfMemoryException even if the pod looks far from OOM.
+            GcHeapLimitBytes = gc.TotalAvailableMemoryBytes,
             GcPauseTimePercent = gc.PauseTimePercentage,
             GcTotalPauseMs = GC.GetTotalPauseDuration().TotalMilliseconds,
             Gen2Collections = GC.CollectionCount(2),
@@ -357,6 +361,8 @@ sealed class ReplicaSnapshot
     public long MemoryCurrentBytes { get; set; }
     public long? MemoryLimitBytes { get; set; }
     public long GcHeapBytes { get; set; }
+    public long GcCommittedBytes { get; set; }
+    public long GcHeapLimitBytes { get; set; }
     public double GcPauseTimePercent { get; set; }
     public double GcTotalPauseMs { get; set; }
     public int Gen2Collections { get; set; }

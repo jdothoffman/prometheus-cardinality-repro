@@ -80,6 +80,48 @@ spec:
   ports:
     - { name: http, port: 8080, targetPort: http }
 ---
+# The driver reads pods, pod logs and events (read-only) to put termination reasons, warning events
+# and crashed-container log excerpts into each run's report.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: transactions-driver
+  namespace: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: transactions-driver-evidence
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, events]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: transactions-driver-evidence
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: transactions-driver-evidence
+subjects:
+  - kind: ServiceAccount
+    name: transactions-driver
+    namespace: demo
+---
+# Run records and HTML reports survive driver restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: transactions-driver-data
+  namespace: demo
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: { storage: 1Gi }
+---
 # Load-test console (same image, APP_ROLE=driver). Runs on the control-plane node so generating load
 # doesn't compete for CPU with the replicas under test on the app pool.
 apiVersion: apps/v1
@@ -90,14 +132,19 @@ metadata:
   labels: { app: transactions-driver }
 spec:
   replicas: 1
+  strategy: { type: Recreate } # one writer for the data volume
   selector:
     matchLabels: { app: transactions-driver }
   template:
     metadata:
       labels: { app: transactions-driver }
     spec:
+      serviceAccountName: transactions-driver
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: transactions-driver-data }
       containers:
         - name: driver
           image: transactions-api:local
@@ -106,6 +153,7 @@ spec:
             - { name: http, containerPort: 8080 }
           env:
             - { name: APP_ROLE, value: driver }
+            - { name: DATA_DIR, value: /data }
             - { name: TARGET_URL, value: "http://transactions-api.demo.svc.cluster.local:8080" }
             - { name: REPLICA_DNS, value: "transactions-api-headless.demo.svc.cluster.local" }
             - { name: PROMETHEUS_URL, value: "http://kps-prometheus.monitoring.svc:9090" }
@@ -115,6 +163,8 @@ spec:
             - { name: GRAFANA_PASSWORD, value: admin }
             - { name: Logging__LogLevel__Microsoft.AspNetCore, value: Warning }
             - { name: Logging__LogLevel__System.Net.Http.HttpClient, value: Warning }
+          volumeMounts:
+            - { name: data, mountPath: /data }
           resources:
             requests: { cpu: 500m, memory: 128Mi }
             limits: { memory: 768Mi }

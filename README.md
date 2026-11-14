@@ -72,6 +72,30 @@ How it works:
 - **What the console shows:** throughput, client-side p50/p95/p99, failures by type, and per-replica memory and CPU throttling. Replica figures are read directly from each pod's cgroup through a headless Service, so they keep working when Prometheus is down. It also shows Prometheus and Alloy memory, plus node memory.
 - **Labels stay applied across restarts.** The label toggle reaches every replica without a restart, and is re-applied to replicas that come back after an OOMKill.
 
+### Test names and reports
+
+Give each run a **name**, and optionally **notes**, in the console before you click Start or Dry run. When a run ends, the driver waits about 25s for the metrics pipeline to catch up. Then it collects evidence while it's still fresh, because Kubernetes events expire after about an hour and a crashed container's logs are lost on its next restart. The evidence is saved as a **self-contained HTML report**:
+
+- **Most likely cause** and a list of **findings**, from rule-based analysis. It covers:
+  - the client failure sequence
+  - pod terminations (OOMKilled, or killed by the liveness probe)
+  - .NET `OutOfMemoryException` hitting the GC heap hard limit
+  - GC heap headroom before the test
+  - CPU pinned at the limit
+  - Prometheus and Alloy health
+  - the cardinality reached
+- Degradation milestones, ramp steps, configuration, and dry-run checks
+- Charts: client throughput, latency, failures and in-flight requests, plus from Prometheus:
+  - CPU per pod
+  - **.NET GC heap against the GC heap limit**
+  - container memory and restarts
+  - Prometheus and Alloy memory
+  - series counts
+  - Alloy OTLP in and remote_write failures
+- Container terminations, Kubernetes warning events, and **exception lines and the fatal stack from crashed containers' logs**
+
+Open or download a report from **Run history** in the console, or run `make reports` to copy all of them to `./reports/` (gitignored). Runs and reports are stored on a persistent volume, so they survive driver restarts. The driver gets read-only access to pods, pod logs and events through its own ServiceAccount.
+
 ### Where the starvation comes from
 
 | Resource | Constraint |
@@ -118,7 +142,7 @@ Undo with `make unfix-app` / `make uncap-app` / `make calm` / `make unchurn` / `
 ## Files
 
 ```
-app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs + wwwroot/ (load-test console)
+app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs + wwwroot/ (load-test console), Report.cs (run reports)
 agent/config.alloy           Alloy pipeline, unguarded (production-like)
 agent/config-guarded.alloy   Alloy pipeline with memory_limiter + relabel drop
 agent/values.yaml            Alloy chart values: agent node pool, OTLP ports, 1Gi limit

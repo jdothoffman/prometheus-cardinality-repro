@@ -17,7 +17,7 @@ APP_NODES      := k3d-$(CLUSTER)-agent-0 k3d-$(CLUSTER)-agent-1
 
 .PHONY: help prereqs up monitoring agent app all ui load load-stop load-logs explode calm churn \
         unchurn reset-prometheus agent-down agent-up guard-agent unguard-agent fix-app unfix-app \
-        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom
+        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -82,6 +82,11 @@ ui: ## Port-forward the load-test console :8080, Grafana :3000, Prometheus :9090
 	  $(K) -n monitoring port-forward svc/kps-grafana 3000:80 & \
 	  while true; do $(K) -n monitoring port-forward svc/kps-prometheus 9090:9090; sleep 3; done & \
 	  wait
+
+reports: ## Copy every run's HTML report from the driver to ./reports/
+	@mkdir -p reports
+	$(K) -n demo cp $$($(K) -n demo get pod -l app=transactions-driver -o jsonpath='{.items[0].metadata.name}'):/data/reports ./reports
+	@ls -1t reports/*.html 2>/dev/null | head -20
 
 load: ## Alternative to the UI: constant k6 load (RATE=req/s, default 300; DURATION=30m)
 	$(K) -n demo delete job k6-load --ignore-not-found
