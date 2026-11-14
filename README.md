@@ -100,3 +100,7 @@ k8s/load-k6.yaml             k6 script + Job (remote-writes its latency to Prome
 ```sh
 make down
 ```
+
+## License
+
+[MIT](LICENSE)
