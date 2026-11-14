@@ -45,7 +45,7 @@ The baseline is 4 × 4 × 10 × 200 = **32,000 series**: already large, but stab
 ```sh
 make prereqs     # brew install k3d helm
 make all         # cluster + node pools, monitoring, Alloy, app
-make ui          # Grafana http://localhost:3000 (admin/admin) -> Dashboards > Cardinality Repro
+make ui          # Grafana http://localhost:3000 (admin/admin) -> Dashboards > Cardinality Repro / Cardinality Deep Dive
 make load        # k6, RATE=300 req/s for DURATION=30m (make load RATE=600 to go faster)
 ```
 
@@ -125,7 +125,7 @@ agent/values.yaml            Alloy chart values: agent node pool, OTLP ports, 1G
 cluster/k3d-config.yaml      k3d cluster (app pool); `make up` adds the agent pool node
 monitoring/values.yaml       kube-prometheus-stack: 1Gi Prometheus limit, remote-write receiver on
 monitoring/values-starvation.yaml  overlay: Prometheus unlimited, on the app pool (noisy neighbour)
-monitoring/dashboards/       "Cardinality Repro" Grafana dashboard
+monitoring/dashboards/       Grafana dashboards: "Cardinality Repro" (overview), "Cardinality Deep Dive" (5 sections: flow, cardinality, Prometheus, app, Alloy)
 k8s/app.yaml                 transactions-api (4 replicas, app pool), headless Service, transactions-driver
 k8s/load-k6.yaml             k6 script + Job (remote-writes its latency to Prometheus)
 ```

@@ -635,6 +635,9 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
             using var req = new HttpRequestMessage(HttpMethod.Get, $"{_grafana}/api/dashboards/uid/cardinality-repro");
             req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", _grafanaAuth);
             using var resp = await _http.SendAsync(req, ct);
+            if (resp.StatusCode == HttpStatusCode.Unauthorized)
+                return (false, "Grafana is up, but the driver's login was rejected (admin password changed?). " +
+                               "Set GRAFANA_PASSWORD on deploy/transactions-driver, or reset the Grafana admin password.");
             return (resp.IsSuccessStatusCode, resp.IsSuccessStatusCode
                 ? "\"Cardinality Repro\" is provisioned" : $"HTTP {(int)resp.StatusCode} from Grafana");
         });
