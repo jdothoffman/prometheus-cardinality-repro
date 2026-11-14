@@ -10,3 +10,6 @@ configMapGenerator:
   - name: grafana-dashboard-cardinality
     files:
       - cardinality.json
+  - name: grafana-dashboard-deep-dive
+    files:
+      - deep-dive.json
