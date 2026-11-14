@@ -63,19 +63,51 @@ static class Driver
         app.MapPost("/api/test/dryrun", (TestConfig config, LoadTest test) =>
             test.Start(DryRunPreset.Apply(config)) ? Results.Ok(new { started = true }) : Results.Conflict(new { error = "a test is already running" }));
 
+        // Presets: bounded (no response_time) | unbounded (all labels, response_time at 6 decimals).
         app.MapPost("/api/mode", async (string value, ReplicaMonitor replicas, LoadTest test) =>
         {
             if (value is not ("bounded" or "unbounded")) return Results.BadRequest(new { error = "bounded | unbounded" });
             if (test.DryRunActive && value != "bounded") return Results.Conflict(new { error = "labels are locked to bounded during a dry run" });
-            var applied = await replicas.ApplyModeAsync(value);
+            var applied = await replicas.ApplyLabelsAsync(Labels.ForMode(value));
             return Results.Ok(new { mode = value, applied });
+        });
+
+        // Fine-grained: which labels http_transactions_total carries, and response_time precision.
+        app.MapPost("/api/labels", async (LabelConfig config, ReplicaMonitor replicas, LoadTest test) =>
+        {
+            var c = Labels.Normalize(config);
+            if (test.DryRunActive && c.Labels!.Contains("response_time"))
+                return Results.Conflict(new { error = "response_time is locked off during a dry run" });
+            var applied = await replicas.ApplyLabelsAsync(c);
+            return Results.Ok(new { labels = c, description = Labels.Describe(c), applied });
+        });
+
+        // Restart the api replicas (rollout restart). Clears the SDK's in-memory series, which removing a
+        // label does not: cumulative state keeps every series already created until the process restarts.
+        app.MapPost("/api/replicas/restart", async (KubeClient kube, LoadTest test) =>
+        {
+            if (test.DryRunActive) return Results.Conflict(new { error = "not during a dry run" });
+            if (!kube.Available) return Results.Problem("Kubernetes API not available to the driver");
+            try
+            {
+                await kube.RolloutRestartAsync("demo", "transactions-api");
+                return Results.Ok(new { restarting = true });
+            }
+            catch (Exception ex) { return Results.Problem(ex.Message); }
         });
 
         app.MapGet("/api/test/status", (int? since, LoadTest test, ReplicaMonitor replicas, PipelineMonitor pipeline) =>
             Results.Json(new
             {
                 test = test.Status(since ?? 0),
-                replicas = new { desiredMode = replicas.DesiredMode, observedMode = replicas.ObservedMode, pods = replicas.Latest },
+                replicas = new
+                {
+                    desiredLabels = replicas.DesiredLabels,
+                    observed = replicas.ObservedDescription,
+                    current = replicas.CurrentLabels,
+                    currentDescription = Labels.Describe(replicas.CurrentLabels),
+                    pods = replicas.Latest,
+                },
                 replicaHistory = replicas.HistorySince(test.StartedAtUnix),
                 pipeline = pipeline.Latest,
                 pipelineHistory = pipeline.HistorySince(test.StartedAtUnix),
@@ -147,7 +179,9 @@ sealed class LoadTest
     private long _startedTs;
     private volatile string _state = "idle";
     private string? _stopReason;
-    private string _modeAtStart = "?";
+    private string _modeAtStart = "?"; // human-readable label set at the start of the run
+    private LabelConfig _labelsAtStart = Labels.ForMode("bounded");
+    private string _agentProfile = "unknown";
     private Milestone? _degraded, _firstTimeout, _errors5, _errors50;
 
     public LoadTest(IConfiguration cfg, ReplicaMonitor replicas, PipelineMonitor pipeline, RunStore store,
@@ -196,17 +230,24 @@ sealed class LoadTest
             _checks = [];
             _checksForDryRun = _config.DryRun;
             _startedTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            _modeAtStart = _config.DryRun ? "bounded" : _replicas.DesiredMode ?? _replicas.ObservedMode;
+            var current = _replicas.CurrentLabels;
+            // A dry run keeps the chosen labels but never response_time, so it can't explode anything.
+            _labelsAtStart = _config.DryRun
+                ? new LabelConfig(current.Labels!.Where(l => l != "response_time").ToArray(), current.ResponseTimeDecimals)
+                : current;
+            _modeAtStart = Labels.Describe(_labelsAtStart);
+            _agentProfile = _pipeline.AgentProfile;
             var name = (c.Name ?? "").Trim();
             _name = name.Length > 0 ? name[..Math.Min(80, name.Length)]
-                : _config.DryRun ? "Dry run" : $"{_modeAtStart} ramp {_config.StartRate}→{_config.MaxRate} req/s";
+                : _config.DryRun ? "Dry run"
+                : $"{(_labelsAtStart.Labels!.Contains("response_time") ? "response_time" : "bounded")} · {_agentProfile} agent · {_config.StartRate}→{_config.MaxRate} req/s";
             _notes = string.IsNullOrWhiteSpace(c.Notes) ? null : c.Notes.Trim()[..Math.Min(2000, c.Notes.Trim().Length)];
             _state = "running";
             _cts = new CancellationTokenSource();
             var config = _config;
             var ct = _cts.Token;
             _ = Task.Run(() => RunAsync(config, ct));
-            _log.LogInformation("Load test started: {Config} mode={Mode}", config, _modeAtStart);
+            _log.LogInformation("Load test started: {Config} labels={Labels} agent={Agent}", config, _modeAtStart, _agentProfile);
             return true;
         }
     }
@@ -223,7 +264,7 @@ sealed class LoadTest
 
     private async Task RunAsync(TestConfig cfg, CancellationToken ct)
     {
-        if (cfg.DryRun) await _replicas.ApplyModeAsync("bounded"); // never explode during a dry run
+        if (cfg.DryRun) await _replicas.ApplyLabelsAsync(_labelsAtStart); // never explode during a dry run
         var rate = cfg.StartRate;
         _targetRate = rate;
         var sw = Stopwatch.StartNew();
@@ -333,6 +374,9 @@ sealed class LoadTest
                 Name = _name,
                 Notes = _notes,
                 Mode = _modeAtStart,
+                Labels = _labelsAtStart.Labels ?? [],
+                ResponseTimeDecimals = _labelsAtStart.ResponseTimeDecimals ?? 6,
+                AgentProfile = _agentProfile,
                 DryRun = cfg.DryRun,
                 Config = cfg,
                 StartedAtUnix = _startedTs,
@@ -358,7 +402,7 @@ sealed class LoadTest
         var p95 = pts.Count == 0 ? 0 : pts.Max(p => p.P95);
         var reps = _replicas.Latest;
         var reachable = reps.Count(r => r.Reachable);
-        var unbounded = reps.Where(r => r.Reachable && r.Stats?.Mode != "bounded").Select(r => r.Stats?.Pod).ToList();
+        var unbounded = reps.Where(r => r.Reachable && r.Stats?.Labels.Contains("response_time") == true).Select(r => r.Stats?.Pod).ToList();
 
         var checks = new List<Check>
         {
@@ -480,6 +524,7 @@ sealed class LoadTest
                 startedAtUnix = _startedTs,
                 config = _config,
                 mode = _modeAtStart,
+                agentProfile = _agentProfile,
                 targetRate = _targetRate,
                 inFlight = Volatile.Read(ref _inFlight),
                 stopReason = _stopReason,
@@ -511,12 +556,43 @@ sealed class ReplicaView
     public int RestartsSeen { get; set; }
     public double? CpuCores { get; set; }
     public double? ThrottledPct { get; set; }
+    // Export path, derived between two polls (~2s).
+    public double? ExportAvgMs { get; set; }
+    public double? ExportMaxMs { get; set; }
+    public long ExportFailuresDelta { get; set; }
+    public long ExportRetriesDelta { get; set; }
+    public long ExportFailuresTotal { get; set; }
+    public long ExportRetriesTotal { get; set; }
+    public double? SecondsSinceExportSuccess { get; set; }
     public ReplicaSnapshot? Stats { get; set; }
     public long LastSeenUnix { get; set; }
 }
 
 sealed record ReplicaSample(long Ts, string Pod, long MemoryBytes, double? CpuCores, double? ThrottledPct, bool Reachable,
-    long? GcHeapBytes = null, long? GcHeapLimitBytes = null);
+    long? GcHeapBytes = null, long? GcHeapLimitBytes = null, double? ExportMaxMs = null, long? ExportPoints = null,
+    long? ExportBytes = null, long ExportFailures = 0, long ExportRetries = 0);
+
+static class Labels
+{
+    public static LabelConfig Normalize(LabelConfig c) => new(
+        LabelSet.All.Where(l => (c.Labels ?? []).Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray(),
+        Math.Clamp(c.ResponseTimeDecimals ?? 6, 0, 6));
+
+    public static LabelConfig ForMode(string mode) =>
+        new(mode == "unbounded" ? LabelSet.All : LabelSet.Bounded, 6);
+
+    public static string Key(LabelConfig c)
+    {
+        var l = c.Labels ?? [];
+        return string.Join(",", l) + (l.Contains("response_time") ? $"@{c.ResponseTimeDecimals ?? 6}" : "");
+    }
+
+    public static string Describe(LabelConfig c) =>
+        (c.Labels ?? []).Length == 0 ? "(no labels)"
+            : string.Join(", ", (c.Labels ?? []).Select(l => l == "response_time" ? $"response_time({c.ResponseTimeDecimals ?? 6}dp)" : l));
+
+    public static string Describe(ReplicaSnapshot s) => Describe(new LabelConfig(s.Labels, s.ResponseTimeDecimals));
+}
 
 // Polls every api replica directly (headless Service DNS) every 2s. Works even when Prometheus is down.
 sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : BackgroundService
@@ -527,36 +603,50 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
     private readonly List<ReplicaSample> _history = [];
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    public volatile string? DesiredMode;
+    // Label set chosen in the console; re-applied to replicas that restart with the env default.
+    public volatile LabelConfig? DesiredLabels;
 
     public List<ReplicaView> Latest => _views.Values.OrderBy(v => v.Stats?.Pod ?? v.Ip).ToList();
 
-    public string ObservedMode
+    public LabelConfig? ObservedLabels
     {
         get
         {
-            var modes = _views.Values.Where(v => v.Reachable && v.Stats is not null).Select(v => v.Stats!.Mode).Distinct().ToList();
-            return modes.Count switch { 0 => "unknown", 1 => modes[0], _ => "mixed" };
+            var snaps = _views.Values.Where(v => v.Reachable && v.Stats is not null).Select(v => v.Stats!).ToList();
+            var keys = snaps.Select(s => s.LabelKey).Distinct().ToList();
+            return keys.Count == 1 ? new LabelConfig(snaps[0].Labels, snaps[0].ResponseTimeDecimals) : null;
         }
     }
+
+    public string ObservedDescription
+    {
+        get
+        {
+            var keys = _views.Values.Where(v => v.Reachable && v.Stats is not null).Select(v => v.Stats!.LabelKey).Distinct().Count();
+            return keys switch { 0 => "unknown", 1 => Labels.Describe(ObservedLabels!), _ => "mixed" };
+        }
+    }
+
+    public LabelConfig CurrentLabels => DesiredLabels ?? ObservedLabels ?? Labels.ForMode("bounded");
 
     public List<ReplicaSample> HistorySince(long ts)
     {
         lock (_history) return ts == 0 ? [] : _history.Where(s => s.Ts >= ts).ToList();
     }
 
-    public async Task<int> ApplyModeAsync(string mode)
+    public async Task<int> ApplyLabelsAsync(LabelConfig config)
     {
-        DesiredMode = mode;
-        var results = await Task.WhenAll(_views.Keys.Select(ip => SetModeAsync(ip, mode)));
+        var c = Labels.Normalize(config);
+        DesiredLabels = c;
+        var results = await Task.WhenAll(_views.Keys.Select(ip => SetLabelsAsync(ip, c)));
         return results.Count(ok => ok);
     }
 
-    private async Task<bool> SetModeAsync(string ip, string mode)
+    private async Task<bool> SetLabelsAsync(string ip, LabelConfig c)
     {
         try
         {
-            using var r = await _http.PostAsync($"http://{ip}:8080/admin/mode?value={mode}", null);
+            using var r = await _http.PostAsJsonAsync($"http://{ip}:8080/admin/labels", c, Json);
             return r.IsSuccessStatusCode;
         }
         catch { return false; }
@@ -589,9 +679,14 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
         lock (_history)
         {
             foreach (var v in _views.Values)
-                _history.Add(new ReplicaSample(now, v.Stats?.Pod ?? v.Ip, v.Reachable ? v.Stats?.MemoryCurrentBytes ?? 0 : 0,
+            {
+                var s = v.Stats;
+                _history.Add(new ReplicaSample(now, s?.Pod ?? v.Ip, v.Reachable ? s?.MemoryCurrentBytes ?? 0 : 0,
                     v.Reachable ? v.CpuCores : null, v.Reachable ? v.ThrottledPct : null, v.Reachable,
-                    v.Reachable ? v.Stats?.GcHeapBytes : null, v.Stats?.GcHeapLimitBytes));
+                    v.Reachable ? s?.GcHeapBytes : null, s?.GcHeapLimitBytes,
+                    v.Reachable ? v.ExportMaxMs : null, v.Reachable ? s?.ExportLastPoints : null, v.Reachable ? s?.ExportLastBytes : null,
+                    v.Reachable ? v.ExportFailuresDelta : 0, v.Reachable ? v.ExportRetriesDelta : 0));
+            }
             if (_history.Count > 20_000) _history.RemoveRange(0, _history.Count - 20_000);
         }
     }
@@ -604,9 +699,9 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
             var snap = await _http.GetFromJsonAsync<ReplicaSnapshot>($"http://{ip}:8080/admin/stats", Json, ct)
                        ?? throw new InvalidOperationException("empty stats");
             var prev = view.Stats;
-            if (prev is not null && prev.Pod == snap.Pod)
+            view.ExportFailuresDelta = view.ExportRetriesDelta = 0;
+            if (prev is not null && prev.Pod == snap.Pod && snap.UptimeSeconds >= prev.UptimeSeconds)
             {
-                if (snap.UptimeSeconds < prev.UptimeSeconds) view.RestartsSeen++; // container restarted (e.g. OOMKilled)
                 var dt = (snap.SampledAtUnixMs - prev.SampledAtUnixMs) / 1000.0;
                 if (dt > 0 && snap.CpuUsageUsec >= prev.CpuUsageUsec)
                 {
@@ -614,15 +709,29 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
                     var periods = snap.CpuPeriods - prev.CpuPeriods;
                     view.ThrottledPct = periods > 0 ? Math.Round(100.0 * (snap.CpuThrottledPeriods - prev.CpuThrottledPeriods) / periods, 1) : 0;
                 }
+                var exports = snap.Exports - prev.Exports;
+                if (exports > 0) view.ExportAvgMs = Math.Round((snap.ExportTotalMs - prev.ExportTotalMs) / exports, 1);
+                view.ExportFailuresDelta = Math.Max(0, snap.ExportFailures - prev.ExportFailures);
+                view.ExportRetriesDelta = Math.Max(0, snap.ExportHttpRetries - prev.ExportHttpRetries);
             }
+            else if (prev is not null && prev.Pod == snap.Pod)
+            {
+                view.RestartsSeen++; // uptime went backwards: the container restarted (e.g. OOMKilled)
+            }
+            // The replica resets its max-export-duration on every read, so this is the max since the last poll.
+            view.ExportMaxMs = snap.Exports > 0 ? Math.Round(Math.Max(snap.ExportMaxMsSinceLastRead, 0), 1) : null;
+            view.ExportFailuresTotal = snap.ExportFailures;
+            view.ExportRetriesTotal = snap.ExportHttpRetries;
+            view.SecondsSinceExportSuccess = snap.ExportLastSuccessUnixMs > 0
+                ? Math.Round((snap.SampledAtUnixMs - snap.ExportLastSuccessUnixMs) / 1000.0, 1) : null;
             view.Stats = snap;
             view.Reachable = true;
             view.LastError = null;
             view.LastSeenUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            // Restarted replicas come back with the env default; keep the chosen mode applied.
-            var desired = DesiredMode;
-            if (desired is not null && snap.Mode != desired) await SetModeAsync(ip, desired);
+            // Restarted replicas come back with the env default; keep the chosen labels applied.
+            var desired = DesiredLabels;
+            if (desired is not null && snap.LabelKey != Labels.Key(desired)) await SetLabelsAsync(ip, desired);
         }
         catch (Exception ex)
         {
@@ -702,6 +811,7 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
     private readonly List<PipelineSample> _history = [];
 
     public object? Latest { get; private set; }
+    public string AgentProfile { get; private set; } = "unknown";
 
     public List<PipelineSample> HistorySince(long ts)
     {
@@ -734,6 +844,12 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
         var promRestarts = await ScalarAsync($"max(kube_pod_container_status_restarts_total{{{prom}}})", ct);
         var alloyMem = await ScalarAsync($"max(container_memory_working_set_bytes{{{alloy}}})", ct);
         var alloyLimit = await ScalarAsync($"max(kube_pod_container_resource_limits{{{alloy},resource=\"memory\"}})", ct);
+        var alloyCpuLimit = await ScalarAsync($"max(kube_pod_container_resource_limits{{{alloy},resource=\"cpu\"}})", ct);
+        var alloyCpu = await ScalarAsync($"sum(rate(container_cpu_usage_seconds_total{{{alloy}}}[1m]))", ct);
+        var alloyRefused = await ScalarAsync("sum(rate(otelcol_receiver_refused_metric_points_total[1m]))", ct);
+        // "constrained" = the make agent-constrained profile (CPU-limited Alloy with a memory_limiter).
+        AgentProfile = alloyMem is null && alloyLimit is null ? "unknown"
+            : alloyCpuLimit is { } cl && cl <= 0.5 ? "constrained" : "normal";
         var promNode = await LabelAsync("max by (node) (kube_pod_info{namespace=\"monitoring\",pod=~\"prometheus-.*\"})", "node", ct);
         var nodes = await VectorAsync(
             "sum by (node) (container_memory_working_set_bytes{container!=\"\",container!=\"POD\"}) / on (node) max by (node) (kube_node_status_capacity{resource=\"memory\"})",
@@ -743,7 +859,7 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
         {
             up = true, sampledAt = now, headSeries = head, txSeries = tx,
             prometheus = new { memory = promMem, limit = promLimit, restarts = promRestarts, node = promNode },
-            alloy = new { memory = alloyMem, limit = alloyLimit },
+            alloy = new { memory = alloyMem, limit = alloyLimit, cpu = alloyCpu, cpuLimit = alloyCpuLimit, refusedPerSec = alloyRefused, profile = AgentProfile },
             nodeMemoryPct = nodes,
         };
         lock (_history)

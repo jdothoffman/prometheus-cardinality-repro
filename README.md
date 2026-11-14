@@ -107,6 +107,47 @@ Open or download a report from **Run history** in the console, or run `make repo
 
 Run the bug test under both Prometheus profiles. `profile-oom` shows the pipeline failing while the app keeps serving. `profile-starvation` shows the original incident: the monitoring stack starving the production app.
 
+## Experiment: does metrics back pressure cause contention with the live app?
+
+**Hypothesis:** high-cardinality metrics, pushed to an agent that can't keep up, create back pressure. That cost lands on the app pod's CPU and heap and competes with request handling.
+
+**What's measured, from inside the app:** every OTLP export is wrapped. The measurement covers serialize + send + retries, the points per export, and the bytes, status code and retries for each HTTP attempt. The console reads this directly every 2s, the report charts it, and Grafana shows it under Deep Dive → "6 · Export path".
+
+**Agent profiles:**
+
+| Command | Alloy | Effect |
+|---|---|---|
+| `make agent-normal` (default) | 1Gi, no CPU limit, no memory_limiter | Keeps up; no back pressure |
+| `make agent-constrained` | 250m CPU / 384Mi + memory_limiter (70%) | Slows down and refuses data with HTTP 503. The app retries, holding payloads in memory (`OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=in_memory`). |
+
+**The 2×2 matrix.** Use the same ramp for every run and click **Restart replicas** before each one:
+
+| | `make agent-normal` | `make agent-constrained` |
+|---|---|---|
+| **Bounded preset** | baseline capacity | back pressure alone |
+| **+ response_time preset** | cardinality alone | **cardinality + back pressure** |
+
+**Verdict:** each report includes a **Metrics back pressure** finding.
+- **CONFIRMED** needs all of the following, and no other failure (such as GC heap pre-allocation) explaining it:
+  - the app degraded
+  - the export path was under pressure: duration at least 50% of the 8s timeout, or any failures or retries
+  - the pods showed CPU contention: throttling at least 25%, or CPU pinned
+- **PARTIAL** or **NOT CONFIRMED** otherwise, with the reason.
+
+The finding also reports the correlation between export cost and client p95.
+
+**Cardinality limit scope:** `OTEL_CARDINALITY_LIMIT_SCOPE=transactions` (the default) applies the 200k limit only to `http_transactions_total`. With `all`, the SDK pre-allocates storage for every instrument: about 560 MiB, or 97% of the GC heap limit. The app then dies of `OutOfMemoryException` before any back pressure can build. That's a separate finding.
+
+## Finding the way back: step labels down
+
+Once the failure reproduces, use the label controls in the console to reduce cardinality one step at a time. Re-run the same ramp after each step and compare in Run history:
+
+1. `response_time` precision 6 dp → 3 dp (≈1ms buckets) → 2 dp (≈10ms) → 1 dp (≈100ms) → off. The right fix is the `http_transaction_duration_seconds` histogram, which is already recorded.
+2. Then `pod` (about 200 values): drop it, or rely on the resource's `instance`.
+3. Then `product`, `state`, `consume_type`, if needed.
+
+Click **Apply labels**, then **Restart replicas** before each run. With cumulative temporality, removing a label doesn't free the series the SDK already holds; only a restart does.
+
 ## Reproducing the incident with make targets
 
 | Step | Command | What you should see |
@@ -145,6 +186,7 @@ Undo with `make unfix-app` / `make uncap-app` / `make calm` / `make unchurn` / `
 app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs + wwwroot/ (load-test console), Report.cs (run reports)
 agent/config.alloy           Alloy pipeline, unguarded (production-like)
 agent/config-guarded.alloy   Alloy pipeline with memory_limiter + relabel drop
+agent/config-constrained.alloy + values-constrained.yaml   "constrained" agent profile (back pressure)
 agent/values.yaml            Alloy chart values: agent node pool, OTLP ports, 1Gi limit
 cluster/k3d-config.yaml      k3d cluster (app pool); `make up` adds the agent pool node
 monitoring/values.yaml       kube-prometheus-stack: 1Gi Prometheus limit, remote-write receiver on

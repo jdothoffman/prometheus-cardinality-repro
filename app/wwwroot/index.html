@@ -107,6 +107,11 @@
   .checks li.ok .ic { color: var(--ok); } .checks li.bad .ic { color: var(--bad); } .checks li.wait .ic { color: var(--muted); }
   .checks li .d { grid-column: 2; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   .seg button:disabled { cursor: not-allowed; opacity: .5; }
+  .labels { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin: 4px 0; }
+  label.chk { justify-content: flex-start; gap: 6px; margin: 2px 0; }
+  label.chk.bad { grid-column: 1 / -1; color: var(--bad); }
+  label.chk select { margin-left: auto; padding: 2px 4px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--ink); font: inherit; font-size: 12px; }
+  code { font-family: var(--mono); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -124,12 +129,27 @@
       <h2>Test setup</h2>
       <input id="testName" class="text" type="text" maxlength="80" placeholder="Test name, e.g. baseline-bounded-1">
       <textarea id="testNotes" class="text" rows="2" maxlength="2000" placeholder="Notes (optional): what you changed, what you expect"></textarea>
-      <div style="font-size:13px">Metric labels</div>
+      <div style="font-size:13px">Labels on <code>http_transactions_total</code></div>
       <div class="seg" id="modeSeg">
-        <button data-mode="bounded" class="bounded">Bounded</button>
-        <button data-mode="unbounded" class="unbounded">+ response_time label</button>
+        <button data-mode="bounded" class="bounded">Bounded preset</button>
+        <button data-mode="unbounded" class="unbounded">+ response_time preset</button>
       </div>
-      <div class="note" id="modeNote">consume_type × state × product × pod (200). Applies to all replicas immediately.</div>
+      <div class="labels" id="labelBoxes">
+        <label class="chk"><input type="checkbox" value="consume_type"> consume_type <span class="hint">4</span></label>
+        <label class="chk"><input type="checkbox" value="state"> state <span class="hint">5</span></label>
+        <label class="chk"><input type="checkbox" value="product"> product <span class="hint">10</span></label>
+        <label class="chk"><input type="checkbox" value="pod"> pod <span class="hint">~200</span></label>
+        <label class="chk bad"><input type="checkbox" value="response_time"> response_time
+          <select id="rtDecimals" title="response_time precision">
+            <option value="6">6 dp ≈ unique</option><option value="3">3 dp ≈ 1 ms</option>
+            <option value="2">2 dp ≈ 10 ms</option><option value="1">1 dp ≈ 100 ms</option>
+          </select></label>
+      </div>
+      <div class="actions" style="margin-top:6px">
+        <button class="btn" id="applyLabels">Apply labels</button>
+        <button class="btn" id="restartReplicas" title="Rollout restart of transactions-api: clears series already held in SDK memory">Restart replicas</button>
+      </div>
+      <div class="note" id="modeNote">Applies to all replicas immediately.</div>
 
       <label>Start rate <span><input id="startRate" type="number" value="50" min="1"> <span class="hint">req/s</span></span></label>
       <label>Step increase <span><input id="stepRate" type="number" value="50" min="0"> <span class="hint">req/s</span></span></label>
@@ -177,6 +197,8 @@
     <section class="panel"><h2>Failures by type / s</h2><div class="legend" id="lgFail"></div><svg class="chart" id="chFail"></svg></section>
     <section class="panel"><h2>Replica memory: container (solid) · .NET heap (dashed)</h2><div class="legend" id="lgMem"></div><svg class="chart" id="chMem"></svg></section>
     <section class="panel"><h2>Replica CPU throttling</h2><div class="legend" id="lgCpu"></div><svg class="chart" id="chCpu"></svg></section>
+    <section class="panel"><h2>OTLP export duration per replica (serialize + send + retries)</h2><div class="legend" id="lgExp"></div><svg class="chart" id="chExp"></svg></section>
+    <section class="panel"><h2>OTLP export payload (points) · retries+failures (dashed)</h2><div class="legend" id="lgPts"></div><svg class="chart" id="chPts"></svg></section>
     <section class="panel"><h2>Metrics pipeline</h2><div class="legend" id="lgPipe"></div><svg class="chart" id="chPipe"></svg></section>
   </div>
 
@@ -200,7 +222,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-let points = [], startedAt = 0, last = null, busy = false;
+let points = [], startedAt = 0, last = null, busy = false, labelsDirty = false;
 
 const fmtN = (v, d = 0) => v == null || isNaN(v) ? '–' : Number(v).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
 const fmtB = (b) => b == null ? '–' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GiB' : (b / 1048576).toFixed(0) + ' MiB';
@@ -280,12 +302,25 @@ function render(data) {
   }
   $('reason').textContent = t.stopReason ? 'Last stop: ' + t.stopReason : '';
 
-  const mode = data.replicas.desiredMode || data.replicas.observedMode;
-  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
-  $('modeNote').textContent = mode === 'unbounded'
-    ? 'response_time="0.023417" is added as a label: nearly every request becomes a new series.'
-    : mode === 'mixed' ? 'Replicas disagree (one is restarting?). Click a mode to re-apply.'
-    : 'consume_type × state × product × pod (200). Applies to all replicas immediately.';
+  // Label controls reflect what the replicas are using, unless the user is mid-edit.
+  const cur0 = data.replicas.current || { labels: [], responseTimeDecimals: 6 };
+  const curLabels = cur0.labels || [];
+  const rtOn = curLabels.includes('response_time');
+  if (!labelsDirty) {
+    document.querySelectorAll('#labelBoxes input').forEach(i => i.checked = curLabels.includes(i.value));
+    $('rtDecimals').value = String(cur0.responseTimeDecimals ?? 6);
+  }
+  document.querySelector('#labelBoxes input[value=response_time]').disabled = locked;
+  $('restartReplicas').disabled = locked;
+  const isBoundedPreset = curLabels.join(',') === 'consume_type,state,product,pod';
+  const isUnboundedPreset = curLabels.length === 5 && (cur0.responseTimeDecimals ?? 6) === 6;
+  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on',
+    b.dataset.mode === 'bounded' ? isBoundedPreset : isUnboundedPreset));
+  $('modeNote').textContent = data.replicas.observed === 'mixed'
+    ? 'Replicas disagree (one is restarting?). Click Apply labels to re-apply.'
+    : labelsDirty ? 'Not applied yet. Click Apply labels.'
+    : rtOn ? `Now: ${data.replicas.currentDescription}. response_time at ${cur0.responseTimeDecimals} dp ${cur0.responseTimeDecimals >= 4 ? 'makes nearly every request a new series' : 'is bucketed'}. Removing a label does not free series already in SDK memory: click Restart replicas.`
+    : `Now: ${data.replicas.currentDescription}. Series already created stay in SDK memory until Restart replicas.`;
 
   const running = t.state !== 'idle';
   $('kTarget').textContent = running ? fmtN(t.targetRate) : '–';
@@ -341,6 +376,20 @@ function render(data) {
     name: pod.split('-').pop(), color: colors[i % colors.length], fmt: (v) => fmtN(v, 0) + '%',
     pts: rh.filter(s => s.pod === pod).map(s => [s.ts - startedAt, s.throttledPct]),
   })), { yMax: 100, yFmt: (v) => v + '%' });
+  const exTimeout = (data.replicas.pods.find(p => p.stats?.exportTimeoutMs) || {}).stats?.exportTimeoutMs;
+  const exInterval = (data.replicas.pods.find(p => p.stats?.exportIntervalMs) || {}).stats?.exportIntervalMs;
+  drawChart($('chExp'), $('lgExp'), pods.map((pod, i) => ({
+    name: pod.split('-').pop(), color: colors[i % colors.length], fmt: fmtMs,
+    pts: rh.filter(s => s.pod === pod).map(s => [s.ts - startedAt, s.exportMaxMs]),
+  })), { yFmt: fmtMs, refs: [
+    ...(exTimeout ? [{ y: exTimeout, label: 'export timeout', color: '--c3' }] : []),
+    ...(exInterval ? [{ y: exInterval, label: 'export interval', color: '--c7' }] : []) ] });
+  drawChart($('chPts'), $('lgPts'), pods.flatMap((pod, i) => [
+    { name: pod.split('-').pop() + ' points', color: colors[i % colors.length],
+      pts: rh.filter(s => s.pod === pod).map(s => [s.ts - startedAt, s.exportPoints]) },
+    { name: pod.split('-').pop() + ' retries+fails', color: colors[i % colors.length], dash: '3 3',
+      pts: rh.filter(s => s.pod === pod).map(s => [s.ts - startedAt, (s.exportFailures || 0) + (s.exportRetries || 0)]) },
+  ]));
 
   const ph = data.pipelineHistory || [];
   const maxHead = Math.max(...ph.map(s => s.headSeries || 0), 1);
@@ -358,8 +407,10 @@ function renderReplicas(pods) {
   const rows = pods.map(v => {
     const s = v.stats || {};
     const memPct = s.memoryLimitBytes ? 100 * s.memoryCurrentBytes / s.memoryLimitBytes : null;
+    const rt = (s.labels || []).includes('response_time');
     const status = !v.reachable ? `<span class="tag bad">${v.lastError || 'down'}</span>`
-      : `<span class="tag ${s.mode === 'unbounded' ? 'bad' : 'ok'}">${s.mode}</span>`;
+      : `<span class="tag ${rt ? 'bad' : 'ok'}" title="${esc((s.labels || []).join(', '))}">${(s.labels || []).length} labels${rt ? ` · rt ${s.responseTimeDecimals}dp` : ''}</span>`;
+    const exTo = s.exportTimeoutMs || 8000;
     return `<tr>
       <td class="mono">${s.pod || v.ip}</td><td>${status}</td>
       <td>${v.restartsSeen ? `<span class="tag warn">${v.restartsSeen}</span>` : 0}</td>
@@ -368,14 +419,15 @@ function renderReplicas(pods) {
         return `<div class="bar"><span style="width:${Math.min(100, g || 0)}%;background:${g > 85 ? css('--bad') : css('--accent')}"></span></div>`; })()}</td>
       <td>${fmtN(v.cpuCores, 2)}${s.cpuLimitCores ? ' / ' + s.cpuLimitCores : ''}</td>
       <td>${v.throttledPct == null ? '–' : fmtN(v.throttledPct, 0) + '%'}</td>
+      <td>${v.exportMaxMs == null ? '–' : `<span style="color:${v.exportMaxMs >= exTo * 0.5 ? css('--bad') : 'inherit'}">${fmtMs(v.exportMaxMs)}</span>`}</td>
+      <td>${fmtSi(s.exportLastPoints)} · ${fmtB(s.exportLastBytes)}</td>
+      <td>${(v.exportRetriesTotal || v.exportFailuresTotal) ? `<span class="tag warn">${fmtN(v.exportRetriesTotal)} / ${fmtN(v.exportFailuresTotal)}</span>` : '0 / 0'}</td>
       <td>${fmtN(s.gcPauseTimePercent, 1)}%</td>
-      <td>${fmtN(s.threadPoolQueue)}</td>
-      <td>${fmtSi(s.unboundedRecords)}</td>
       <td>${fmtSi(s.transactions)}</td>
     </tr>`;
   }).join('');
   $('replicaTable').innerHTML = `<tr><th>Pod</th><th>Labels</th><th>Restarts</th><th>Container mem</th><th>.NET heap / GC limit</th><th>CPU cores</th>
-    <th>Throttled</th><th>GC pause</th><th>Pool queue</th><th>Labelled recs</th><th>Transactions</th></tr>${rows || '<tr><td colspan="11">No replicas found</td></tr>'}`;
+    <th>Throttled</th><th>Export (max)</th><th>Export payload</th><th>Retries / fails</th><th>GC pause</th><th>Transactions</th></tr>${rows || '<tr><td colspan="12">No replicas found</td></tr>'}`;
 }
 
 function renderPipeline(p) {
@@ -389,7 +441,10 @@ function renderPipeline(p) {
     <div>http_transactions_total series</div><div>${fmtSi(p.txSeries)}</div>
     <div>Prometheus memory</div><div>${fmtB(pr.memory)} / ${pr.limit ? fmtB(pr.limit) : '<span class="tag warn">no limit</span>'}${pct(pr.memory, pr.limit)}</div>
     <div>Prometheus node</div><div class="mono">${pr.node || '–'}</div>
-    <div>Alloy memory</div><div>${fmtB(al.memory)} / ${fmtB(al.limit)}${pct(al.memory, al.limit)}</div>`;
+    <div>Agent (Alloy) profile</div><div><span class="tag ${al.profile === 'constrained' ? 'warn' : 'ok'}">${esc(al.profile)}</span></div>
+    <div>Alloy memory</div><div>${fmtB(al.memory)} / ${fmtB(al.limit)}${pct(al.memory, al.limit)}</div>
+    <div>Alloy CPU</div><div>${fmtN(al.cpu, 2)} / ${al.cpuLimit ? fmtN(al.cpuLimit, 2) : 'no limit'} cores</div>
+    <div>Alloy refusing</div><div>${al.refusedPerSec ? `<span class="tag bad">${fmtN(al.refusedPerSec)} points/s</span>` : '0'}</div>`;
   for (const [node, v] of Object.entries(p.nodeMemoryPct || {}).sort()) {
     html += `<div class="mono">${node.replace('k3d-', '')}</div><div>${fmtN(v, 0)}%<div class="bar"><span style="width:${Math.min(100, v)}%;background:${v > 85 ? css('--bad') : css('--accent')}"></span></div></div>`;
   }
@@ -401,7 +456,8 @@ function renderHistory(h) {
   const m = (x) => x ? `${fmtN(x.rate)} req/s` : '–';
   const rows = (h || []).map(r => `<tr>
     <td><div class="runname">${esc(r.name)}</div><div class="mono muted">${esc(r.startedAt.replace('Z', ' UTC'))}</div></td>
-    <td><span class="tag ${r.dryRun ? 'ok' : r.mode === 'unbounded' ? 'bad' : 'ok'}">${r.dryRun ? `dry run ${r.checksPassed}/${r.checksTotal}` : esc(r.mode)}</span></td>
+    <td style="text-align:left;white-space:normal;max-width:260px"><span class="tag ${r.dryRun ? 'ok' : (r.labels || []).includes('response_time') || r.mode === 'unbounded' ? 'bad' : 'ok'}">${r.dryRun ? `dry run ${r.checksPassed}/${r.checksTotal}` : esc(r.mode)}</span>
+      <div class="muted" style="font-size:11.5px">agent: ${esc(r.agentProfile || 'unknown')}</div></td>
     <td>${fmtT(r.durationSeconds)}</td><td>${fmtN(r.maxTargetRate)}</td><td>${fmtN(r.peakOkPerSec)}</td>
     <td>${m(r.degraded)}</td><td>${m(r.firstTimeout)}</td><td>${m(r.errors5)}</td><td>${m(r.errors50)}</td>
     <td class="headl" style="text-align:left">${esc(r.headline)}</td>
@@ -444,8 +500,24 @@ $('stopBtn').onclick = async () => { await fetch('/api/test/stop', { method: 'PO
 document.querySelectorAll('#modeSeg button').forEach(b => b.onclick = async () => {
   const r = await fetch(`/api/mode?value=${b.dataset.mode}`, { method: 'POST' });
   if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not change labels';
+  labelsDirty = false;
   poll();
 });
+document.querySelectorAll('#labelBoxes input, #rtDecimals').forEach(i => i.onchange = () => { labelsDirty = true; });
+$('applyLabels').onclick = async () => {
+  const labels = [...document.querySelectorAll('#labelBoxes input')].filter(i => i.checked).map(i => i.value);
+  const r = await fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ labels, responseTimeDecimals: Number($('rtDecimals').value) }) });
+  if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not change labels';
+  labelsDirty = false;
+  poll();
+};
+$('restartReplicas').onclick = async () => {
+  if (!confirm('Restart all transactions-api replicas? This clears the series they hold in memory. A running test will see errors while they restart.')) return;
+  const r = await fetch('/api/replicas/restart', { method: 'POST' });
+  $('err').textContent = r.ok ? '' : ((await r.json().catch(() => ({}))).detail || (await r.text?.()) || 'Restart failed');
+  poll();
+};
 window.addEventListener('resize', () => last && render(last));
 poll();
 setInterval(poll, 1000);

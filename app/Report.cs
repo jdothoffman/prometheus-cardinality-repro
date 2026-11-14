@@ -65,7 +65,10 @@ sealed class RunRecord
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public string? Notes { get; set; }
-    public string Mode { get; set; } = "";
+    public string Mode { get; set; } = "";        // human-readable label set
+    public string[] Labels { get; set; } = [];
+    public int ResponseTimeDecimals { get; set; } = 6;
+    public string AgentProfile { get; set; } = "unknown";
     public bool DryRun { get; set; }
     public TestConfig Config { get; set; } = new();
     public long StartedAtUnix { get; set; }
@@ -84,7 +87,7 @@ sealed class RunRecord
     public long DurationSeconds => Points.Count == 0 ? 0 : Points[^1].T;
 }
 
-sealed record RunSummary(string Id, string Name, string StartedAt, string Mode, bool DryRun, long DurationSeconds,
+sealed record RunSummary(string Id, string Name, string StartedAt, string Mode, string[] Labels, string AgentProfile, bool DryRun, long DurationSeconds,
     int MaxTargetRate, int PeakOkPerSec, Milestone? Degraded, Milestone? FirstTimeout, Milestone? Errors5,
     Milestone? Errors50, string? StopReason, string Headline, int ChecksPassed, int ChecksTotal);
 
@@ -151,7 +154,7 @@ sealed class RunStore
 
     private static RunSummary Summarize(RunRecord r) => new(
         r.Id, r.Name, DateTimeOffset.FromUnixTimeSeconds(r.StartedAtUnix).ToString("u", CultureInfo.InvariantCulture),
-        r.Mode, r.DryRun, r.DurationSeconds,
+        r.Mode, r.Labels, r.AgentProfile, r.DryRun, r.DurationSeconds,
         r.Points.Count == 0 ? 0 : r.Points.Max(p => p.Target),
         r.Points.Count == 0 ? 0 : r.Points.Max(p => p.Ok),
         r.Milestones.GetValueOrDefault("degraded"), r.Milestones.GetValueOrDefault("firstTimeout"),
@@ -217,6 +220,24 @@ sealed class KubeClient
         return doc.RootElement.Clone();
     }
 
+    // Equivalent of `kubectl rollout restart deployment/<name>`: bump a pod-template annotation.
+    public async Task RolloutRestartAsync(string ns, string deployment)
+    {
+        var patch = JsonSerializer.Serialize(new
+        {
+            spec = new { template = new { metadata = new { annotations = new Dictionary<string, string>
+            {
+                ["kubectl.kubernetes.io/restartedAt"] = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            } } } },
+        });
+        using var req = Req($"/apis/apps/v1/namespaces/{ns}/deployments/{deployment}");
+        req.Method = HttpMethod.Patch;
+        req.Content = new StringContent(patch, Encoding.UTF8, "application/strategic-merge-patch+json");
+        using var resp = await _http!.SendAsync(req);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"rollout restart failed: HTTP {(int)resp.StatusCode} {await resp.Content.ReadAsStringAsync()}");
+    }
+
     public async Task<string?> GetTextAsync(string path)
     {
         using var resp = await _http!.SendAsync(Req(path));
@@ -233,6 +254,7 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
     public async Task<Evidence> CollectAsync(RunRecord r, IReadOnlyList<ReplicaView> replicas)
     {
         var ev = new Evidence();
+        AddExportEvidence(ev, r, replicas);
         var from = r.StartedAtUnix - 30;
         var to = Math.Min(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), r.EndedAtUnix + 30);
         var step = Math.Max(5, (to - from) / 300);
@@ -255,6 +277,81 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
             }
         }
         return ev;
+    }
+
+    // ---------- Export path (from the driver's direct 2s polls of each replica; independent of the pipeline) ----------
+    private static void AddExportEvidence(Evidence ev, RunRecord r, IReadOnlyList<ReplicaView> replicas)
+    {
+        var t0 = r.StartedAtUnix;
+        var during = r.ReplicaSamples.Where(s => s.Ts >= t0 && s.Ts <= r.EndedAtUnix).ToList();
+        var interval = replicas.Select(v => v.Stats?.ExportIntervalMs ?? 0).FirstOrDefault(v => v > 0);
+        var timeout = replicas.Select(v => v.Stats?.ExportTimeoutMs ?? 0).FirstOrDefault(v => v > 0);
+        if (interval == 0) interval = 10_000;
+        if (timeout == 0) timeout = 8_000;
+        static string Short(string pod) => pod.Split('-')[^1];
+        var pods = r.ReplicaSamples.Select(s => s.Pod).Distinct().Order().ToList();
+        List<double?[]> Series(string pod, Func<ReplicaSample, double?> f) =>
+            r.ReplicaSamples.Where(s => s.Pod == pod).Select(s => new double?[] { s.Ts - t0, f(s) }).ToList();
+
+        ev.Charts.Add(new ChartSpec
+        {
+            Title = "OTLP export duration per replica (serialize + send + retries)", Unit = "ms",
+            Note = "Max per 2s poll. Exports run on a background thread but on the pod's own CPU. Approaching the timeout = the agent is pushing back.",
+            Series = pods.Select(p => new ChartSeries(Short(p), Series(p, s => s.ExportMaxMs))).ToList(),
+            Refs = [new RefLine(timeout, "export timeout"), new RefLine(interval, "export interval")],
+        });
+        ev.Charts.Add(new ChartSpec
+        {
+            Title = "OTLP export payload per replica (metric points)", Unit = "short",
+            Note = "Cumulative temporality: every series the SDK has ever seen is re-sent on every export.",
+            Series = pods.Select(p => new ChartSeries(Short(p), Series(p, s => s.ExportPoints))).ToList(),
+        });
+        ev.Charts.Add(new ChartSpec
+        {
+            Title = "OTLP export failures + HTTP retries per replica", Unit = "short",
+            Note = "Retries follow 429/5xx (e.g. Alloy's memory_limiter refusing data) or timeouts; each retry re-sends the payload.",
+            Series = pods.Select(p => new ChartSeries(Short(p), Series(p, s => s.ExportFailures + s.ExportRetries))).ToList(),
+        });
+
+        // Facts for the verdict.
+        var exportMax = during.Select(s => s.ExportMaxMs).Where(v => v.HasValue).Select(v => v!.Value).ToList();
+        ev.Facts["exportIntervalMs"] = interval;
+        ev.Facts["exportTimeoutMs"] = timeout;
+        ev.Facts["exportMaxMs"] = exportMax.Count == 0 ? null : exportMax.Max();
+        ev.Facts["exportPointsPeak"] = during.Select(s => (double?)s.ExportPoints).Max();
+        ev.Facts["exportBytesPeak"] = during.Select(s => (double?)s.ExportBytes).Max();
+        ev.Facts["exportFailures"] = during.Sum(s => s.ExportFailures);
+        ev.Facts["exportRetries"] = during.Sum(s => s.ExportRetries);
+        var thr = during.Where(s => s.Reachable && s.ThrottledPct.HasValue).Select(s => s.ThrottledPct!.Value).ToList();
+        ev.Facts["throttlePeakPct"] = thr.Count == 0 ? null : thr.Max();
+        ev.Facts["throttleAvgPct"] = thr.Count == 0 ? null : Math.Round(thr.Average(), 1);
+
+        // Early vs late export cost (first vs last quarter of the run), to show growth.
+        var dur = Math.Max(1, r.EndedAtUnix - t0);
+        double? Q(long from, long to) { var v = during.Where(s => s.Ts - t0 >= from && s.Ts - t0 < to && s.ExportMaxMs.HasValue).Select(s => s.ExportMaxMs!.Value).ToList(); return v.Count == 0 ? null : v.Average(); }
+        ev.Facts["exportEarlyMs"] = Q(0, dur / 4);
+        ev.Facts["exportLateMs"] = Q(dur * 3 / 4, dur + 1);
+
+        // Does client latency move with export cost? Pearson r between (max export ms across replicas per poll)
+        // and (worst client p95 in the 2s before that poll).
+        var byTs = during.GroupBy(s => s.Ts).Where(g => g.Any(s => s.ExportMaxMs.HasValue))
+            .Select(g => (T: g.Key - t0, E: g.Max(s => s.ExportMaxMs ?? 0))).ToList();
+        var xs = new List<double>(); var ys = new List<double>();
+        foreach (var (t, e) in byTs)
+        {
+            var pts = r.Points.Where(p => p.T > t - 2 && p.T <= t && p.Ok > 0).ToList();
+            if (pts.Count == 0) continue;
+            xs.Add(e); ys.Add(pts.Max(p => p.P95));
+        }
+        ev.Facts["exportLatencyCorrelation"] = Pearson(xs, ys);
+    }
+
+    private static double? Pearson(List<double> x, List<double> y)
+    {
+        if (x.Count < 8) return null;
+        double mx = x.Average(), my = y.Average(), sxy = 0, sxx = 0, syy = 0;
+        for (var i = 0; i < x.Count; i++) { sxy += (x[i] - mx) * (y[i] - my); sxx += (x[i] - mx) * (x[i] - mx); syy += (y[i] - my) * (y[i] - my); }
+        return sxx == 0 || syy == 0 ? null : Math.Round(sxy / Math.Sqrt(sxx * syy), 2);
     }
 
     // ---------- Prometheus ----------
@@ -573,8 +670,46 @@ static class Analyzer
                 (dotnetOom.Count > 0 ? "Alongside the OutOfMemoryExceptions this is the GC running continuously trying to free space (GC thrash), not request work."
                     : "Requests queue behind throttled CPU, raising latency until timeouts.")));
 
-        // 5. Metrics pipeline.
         var fx = ev.Facts;
+
+        // 5. Verdict: did metrics back pressure cause resource contention with the live app?
+        {
+            var timeoutMs = fx.GetValueOrDefault("exportTimeoutMs") ?? 8000;
+            var exportMax = fx.GetValueOrDefault("exportMaxMs");
+            var retries = (fx.GetValueOrDefault("exportRetries") ?? 0) + (fx.GetValueOrDefault("exportFailures") ?? 0);
+            var throttlePeak = fx.GetValueOrDefault("throttlePeakPct");
+            var corr = fx.GetValueOrDefault("exportLatencyCorrelation");
+            var early = fx.GetValueOrDefault("exportEarlyMs");
+            var late = fx.GetValueOrDefault("exportLateMs");
+            var degraded = ms.GetValueOrDefault("degraded") is not null || ms.GetValueOrDefault("firstTimeout") is not null;
+
+            var pressure = exportMax >= 0.5 * timeoutMs || retries > 0;
+            var contention = throttlePeak >= 25 || pinned.Count > 0;
+            var linked = corr >= 0.3;
+            var masked = nearLimitAtStart.Count > 0 || appTerms.Any(t => t.Reason == "OOMKilled") && !pressure;
+
+            var evidence =
+                $"Export duration peaked at {exportMax?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"} ms (timeout {timeoutMs:N0} ms; first quarter avg {early?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"} ms → last quarter {late?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"} ms), " +
+                $"{retries:N0} export failures/retries, payload up to {fx.GetValueOrDefault("exportPointsPeak") ?? 0:N0} points. " +
+                $"Pod CPU throttling peaked at {throttlePeak?.ToString("N0", CultureInfo.InvariantCulture) ?? "?"}%. " +
+                $"Correlation between export cost and client p95: r = {corr?.ToString("N2", CultureInfo.InvariantCulture) ?? "n/a"}. " +
+                $"Agent profile: {r.AgentProfile}.";
+
+            if (degraded && pressure && contention && !masked)
+                f.Add(new("critical", "Metrics back pressure: CONFIRMED — export cost competed with request handling",
+                    evidence + (linked ? " Latency rose with export cost." : " (Latency/export correlation is weak; compare against the same ramp with the normal agent.)")));
+            else if (pressure && (contention || degraded))
+                f.Add(new("warn", "Metrics back pressure: PARTIAL",
+                    evidence + (masked ? " A different failure (GC heap pre-allocation or a container OOMKill) also occurred, so the export path is not the only cause." : "")
+                             + (!degraded ? " The app did not degrade." : "") + (!contention ? " No significant CPU contention in the pods." : "")));
+            else
+                f.Add(new("info", "Metrics back pressure: NOT CONFIRMED",
+                    evidence + (!pressure ? " Exports stayed well within their timeout with no retries, so the agent was not pushing back."
+                        : " The export path was under pressure but the app showed no contention.")
+                             + (masked ? " The failure is explained by something else (see findings above)." : "")));
+        }
+
+        // 6. Metrics pipeline.
         if (ev.PrometheusUp)
         {
             var promPct = fx.GetValueOrDefault("promMemPeak") / fx.GetValueOrDefault("promMemLimit");
@@ -602,7 +737,8 @@ static class Analyzer
 
         var order = new[] { "critical", "warn", "info", "ok" };
         f = f.OrderBy(x => Array.IndexOf(order, x.Severity)).ToList();
-        var headline = f.FirstOrDefault(x => x.Severity == "critical" && x.Title.Contains(".NET", StringComparison.Ordinal))?.Title
+        var headline = f.FirstOrDefault(x => x.Title.StartsWith("Metrics back pressure: CONFIRMED", StringComparison.Ordinal))?.Title
+                       ?? f.FirstOrDefault(x => x.Severity == "critical" && x.Title.Contains(".NET", StringComparison.Ordinal))?.Title
                        ?? f.FirstOrDefault(x => x.Severity == "critical")?.Title
                        ?? f.FirstOrDefault(x => x.Severity == "warn")?.Title
                        ?? "Healthy: no failures";
@@ -759,7 +895,7 @@ const mrow = (label, m) => `<tr><td>${label}</td><td>${m ? n(m.rate) + ' req/s' 
 const c = R.config;
 let html = `
   <h1>${esc(R.name)}</h1>
-  <div class="sub">${esc(when(R.startedAtUnix))} · ${T(R.points.length ? R.points[R.points.length - 1].t : 0)} · labels: <b>${esc(R.mode)}</b>${R.dryRun ? ' · dry run' : ''} · run id <span style="font-family:var(--mono)">${esc(R.id)}</span></div>
+  <div class="sub">${esc(when(R.startedAtUnix))} · ${T(R.points.length ? R.points[R.points.length - 1].t : 0)} · labels: <b>${esc(R.mode)}</b> · agent: <b>${esc(R.agentProfile)}</b>${R.dryRun ? ' · dry run' : ''} · run id <span style="font-family:var(--mono)">${esc(R.id)}</span></div>
   ${R.notes ? `<p>${esc(R.notes)}</p>` : ''}
   <div class="panel headline ${sevOf}"><div class="k">Most likely cause</div><div class="v">${esc(R.headline)}</div>
     <div class="muted" style="margin-top:4px">Stop reason: ${esc(R.stopReason || '–')}</div></div>
@@ -814,7 +950,9 @@ let html = `
     <div>Degraded threshold (p95)</div><div>${n(c.degradedP95Ms)} ms</div>
     <div>Auto-stop at errors</div><div>${n(c.stopErrorPct)}%</div>
     <div>Driver in-flight cap</div><div>${n(c.maxInFlight)}</div>
-    <div>Labels</div><div>${esc(R.mode)}</div>
+    <div>Labels on http_transactions_total</div><div>${esc(R.mode)}</div>
+    <div>Agent profile</div><div>${esc(R.agentProfile)}</div>
+    <div>OTel cardinality limit</div><div>${(R.evidence.pods || [])[0] ? n(R.evidence.pods[0].cardinalityLimit) : '–'}</div>
   </div>
   <footer>Generated by transactions-driver at ${esc(when(R.endedAtUnix))}. Self-contained file: the raw run data is embedded in this page.</footer>`;
 document.getElementById('app').innerHTML = html;

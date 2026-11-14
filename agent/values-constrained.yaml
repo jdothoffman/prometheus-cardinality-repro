@@ -1,0 +1,7 @@
+# Overlay for `make agent-constrained` (applied on top of agent/values.yaml).
+# A deliberately small agent: it can't keep up with high-cardinality cumulative exports, so it slows
+# down and its memory_limiter (config-constrained.alloy) refuses data. Revert with `make agent-normal`.
+alloy:
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 250m, memory: 384Mi }
