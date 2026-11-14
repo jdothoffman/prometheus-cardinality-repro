@@ -49,7 +49,41 @@ make ui          # Grafana http://localhost:3000 (admin/admin) -> Dashboards > C
 make load        # k6, RATE=300 req/s for DURATION=30m (make load RATE=600 to go faster)
 ```
 
-## Reproducing the incident
+## Load-test console (Start button)
+
+`make ui`, then open **http://localhost:8080**. The console is the same .NET image running with `APP_ROLE=driver`, as its own one-replica Deployment on the control-plane node. That way, generating load never takes CPU from the replicas under test.
+
+1. **Dry run (safe).** Click this first. It runs for about 60s at 20→100 req/s with labels locked to bounded, and stops itself at 5% errors. Then it checks every hop and shows a checklist:
+   - driver → API requests succeed, with healthy latency
+   - all replicas are reachable, with bounded labels
+   - Prometheus is up, with memory headroom
+   - Alloy is receiving OTLP, with no remote_write failures
+   - `http_transactions_total` is fresh in Prometheus
+   - the Grafana dashboard exists
+
+   Nothing is pushed toward a crash.
+2. **Baseline run:** set labels to **Bounded** and click **Start test**. The rate steps up (default: 50 req/s, +50 every 30s, up to 2000) until errors reach the auto-stop threshold or the max rate is reached. This finds the system's real capacity.
+3. **Bug run:** switch labels to **+ response_time label** and click **Start test** again with the same ramp. Compare the two runs in **Run history**: the rate at which p95 crossed the degradation threshold, at which the first 3s timeout happened, and at which errors reached 5% and 50%.
+
+How it works:
+- **Load model:** open-model arrival rate. Requests keep coming at the target rate however slow the system gets, so in-flight requests pile up, latency climbs to the timeout, and then errors take over.
+- **Timeout:** 3s per request on the client side, configurable. Errors are counted as timeouts, HTTP 5xx, connection errors (refused or reset, e.g. a pod that was OOMKilled), or "dropped", when the driver hit its in-flight cap.
+- **Business outcomes aren't errors.** Completed, pending, declined and failed are all HTTP 200, so every error you see comes from overload.
+- **What the console shows:** throughput, client-side p50/p95/p99, failures by type, and per-replica memory and CPU throttling. Replica figures are read directly from each pod's cgroup through a headless Service, so they keep working when Prometheus is down. It also shows Prometheus and Alloy memory, plus node memory.
+- **Labels stay applied across restarts.** The label toggle reaches every replica without a restart, and is re-applied to replicas that come back after an OOMKill.
+
+### Where the starvation comes from
+
+| Resource | Constraint |
+|---|---|
+| App pod CPU | Limit of 1 core per replica, so the pod is throttled and requests queue (see the "Throttled" column) |
+| Node CPU | App-pool nodes capped at 3 real CPUs (`make node-cpus`, applied by `make up`) |
+| App pod memory | 768Mi limit. The OTel SDK holds every series in memory (cumulative), so this ends in an OOMKill and connection errors. |
+| Prometheus | `make profile-oom` (default): capped at 1Gi, so it OOM-loops and the app is unaffected. `make profile-starvation`: no memory limit and scheduled on the app pool, so it becomes a noisy neighbour that takes node memory and CPU from the app. |
+
+Run the bug test under both Prometheus profiles. `profile-oom` shows the pipeline failing while the app keeps serving. `profile-starvation` shows the original incident: the monitoring stack starving the production app.
+
+## Reproducing the incident with make targets
 
 | Step | Command | What you should see |
 |---|---|---|
@@ -84,14 +118,15 @@ Undo with `make unfix-app` / `make uncap-app` / `make calm` / `make unchurn` / `
 ## Files
 
 ```
-app/                         .NET 10 transactions-api (Program.cs, Dockerfile)
+app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs + wwwroot/ (load-test console)
 agent/config.alloy           Alloy pipeline, unguarded (production-like)
 agent/config-guarded.alloy   Alloy pipeline with memory_limiter + relabel drop
 agent/values.yaml            Alloy chart values: agent node pool, OTLP ports, 1Gi limit
 cluster/k3d-config.yaml      k3d cluster (app pool); `make up` adds the agent pool node
 monitoring/values.yaml       kube-prometheus-stack: 1Gi Prometheus limit, remote-write receiver on
+monitoring/values-starvation.yaml  overlay: Prometheus unlimited, on the app pool (noisy neighbour)
 monitoring/dashboards/       "Cardinality Repro" Grafana dashboard
-k8s/app.yaml                 transactions-api Deployment (4 replicas, app pool) + Service
+k8s/app.yaml                 transactions-api (4 replicas, app pool), headless Service, transactions-driver
 k8s/load-k6.yaml             k6 script + Job (remote-writes its latency to Prometheus)
 ```
 

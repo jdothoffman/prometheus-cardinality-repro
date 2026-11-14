@@ -1,0 +1,11 @@
+# Overlay for `make profile-starvation` (applied on top of values.yaml).
+# Prometheus becomes a noisy neighbour: no memory limit and scheduled on the app pool, next to the
+# transactions-api replicas. As cardinality explodes it consumes node memory and CPU that the app
+# needs, instead of just OOM-looping inside its own 1Gi limit. Revert with `make profile-oom`.
+prometheus:
+  prometheusSpec:
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: null
+    nodeSelector:
+      pool: app
