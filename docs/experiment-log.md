@@ -40,7 +40,7 @@
 - **Histogram accuracy:** the old buckets put p95 at 89 ms against a true 63 ms. The buckets are now shaped around real latencies (section 4b).
 - **Next:** see [next-steps.md](next-steps.md):
   1. get the production facts (cardinality limit, series per pod, appended labels, Alloy limits, exporter version, pods whose series went stale)
-  2. re-test run A with those settings
+  2. the run-A sweep (needs no facts), then re-test run A with production's settings
   3. size the fleet and agent from production figures, then repeat P300
 
 ## How we recreated it, and how it shows impact on the running app
@@ -610,7 +610,7 @@ Pick-up notes, cluster state and the open decisions are in [next-steps.md](next-
 
 1. ~~Finish the P300 pair~~ **Done: no effect on the app; agent overwhelmed; monitoring dark.** (section 4b)
 2. **Get the production facts:** the cardinality limit settings, series per pod, the bucketing form, the appended labels and where they're added, and Alloy's limits and replicas. Then size the fleet and agent from them.
-3. **Re-test run A with production's real cardinality limit settings.** It needs no bad label and doesn't show as `OOMKilled`.
+3. **Run-A sweep, then the re-test with production's real cardinality limit settings.** The sweep (`OTEL_CARDINALITY_LIMIT_SCOPE=all` at 2k, 10k, 50k, 100k, 200k; idle heap, then a 10-minute soak each) needs no production facts and gives the table production's value is read off. Plan and criteria: [next-steps.md](next-steps.md), decision 2. It needs no bad label and doesn't show as `OOMKilled`.
 4. ~~Deploy the export-failure-reason recording~~ **Done: the ~35 ms failures are the SDK dropping exports over its 64 MiB request limit before sending** (section 4, "L5 × 40 min").
 5. ~~One longer L5 hypothesis and a second L5 control~~ **Done: no stall in 40 minutes; the steady-state CPU effect is within the noise floor of three bounded runs; median p95 at most 1 ms higher.**
 6. **L5 with the normal agent**, to separate agent profile from load level.
