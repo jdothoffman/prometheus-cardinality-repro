@@ -1,30 +1,26 @@
-1. ~~Fix the soak verdict~~ **Done.** A degradation during a soak, with export pressure first, contention, no load saturation, **and a clean control at the same rate, duration and agent**, now means CONFIRMED. Stored runs can be re-analyzed (`POST /api/runs/{id}/reanalyze`). Re-analysis: L4 → CONFIRMED; L1–L3 unchanged; the ramp false positive (run C) is no longer CONFIRMED.
-2. ~~Record GC pauses~~ **Done.** The driver now records GC pause % and gen2 collections in its direct pod polls, and reports chart them. That applies from the next run.
 # Experiment log: metrics pressure vs the live app
 
-**Date:** 2026-11-14 · **Environment:** local k3d cluster (this repo) · **Status:** L1–L4 complete. **L4 reproduced app degradation (one run; repeat pending)**
+**Date:** 2026-11-14 · **Environment:** local k3d cluster (this repo) · **Status:** L1–L4 complete, plus an L4 repeat. **App degradation was seen in 1 of 2 identical L4 runs (not yet systematic)**
 
 ## TL;DR
 
-- **🎯 L4 reproduced the full hypothesis (once; repeat pending).** At a constant 1,650 req/s (70% load) with the **constrained agent**, the high-cardinality run took **all 4 replicas down for about 10 seconds**:
-  - p95 went to 3s, with **2,205 client timeouts** and 61% failing at the worst second
-  - readiness probes failed on every pod
-  - pods were **pinned at their 1-core CPU limit and throttled 20–64%**, while requests alone needed about 70% of it
-  - export pressure began about 2 minutes **before** the stall
-
-  **The control (same load, same agent, bounded labels) had 0 errors.** The report originally said NOT CONFIRMED because of a gap in the soak rule (it only looked for late-run degradation). After the fix, **re-analysis says "Metrics back pressure: CONFIRMED — transient outage at constant load"**, with the matching control found automatically and confirmed clean.
+- **App degradation: seen once, not reproduced.**
+  - **First L4 run** (constrained agent, a constant 1,650 req/s = 70% load): **all 4 replicas went down for about 10 seconds**. p95 reached 3s, there were 2,205 timeouts, and pods were pinned at their 1-core CPU limit while requests alone needed about 70% of it. Export pressure started 2 minutes before the stall, and the control was clean. Re-analysis says CONFIRMED.
+  - **L4 repeat**, with identical settings: **0 errors**, flat latency. The pipeline-side pressure was the same or stronger (330 export failures, 56 retries, Alloy refusing up to 18.6k points/s and OOMKilled 6×, app heap 477 MiB).
+  - **New GC data** from the repeat: GC paused at most **3.2%** of wall time, so GC isn't a major factor.
+  - **The environment is noisy**: the repeat *control* had 17% early throttling and a 377 ms p95 spike with no metrics pressure.
+  - **Conclusion so far:** metrics back pressure *can* coincide with an outage of the live app, but at L4 it isn't systematic (1 of 2 runs). More runs, or a harder level, are needed to measure how often it happens.
 - **Cardinality → back pressure on the agent: reproduced at every level (L1–L4).**
   - With `response_time` as a float label, every replica reaches the OTel SDK cap (200k series) and pushes **35–67 MB every 10s**.
   - Exports hit the 8s timeout and fail or retry.
   - **Grafana Alloy was OOMKilled 4–6 times per run**, on both the normal (1 GiB) and constrained profiles.
-- **With the normal agent, the app was never harmed (L1–L3).** The normal Alloy *crashes*, after which exports fail instantly and the app's export work actually gets *lighter*. The constrained agent *refuses and slows* (503s), so the app retries and keeps that work going. **That's what turned pipeline pressure into app contention.**
+- **With the normal agent, the app was never harmed (L1–L3).** The normal Alloy *crashes*, after which exports fail instantly and the app's export work actually gets *lighter*. The constrained agent *refuses and slows* (503s), so the app retries and keeps that work going: the only condition under which an outage was seen.
 - **Memory pressure is real but capped.** The app's .NET heap rose to **476–488 MiB (83–85% of the 576 MiB GC limit)**, then leveled off when the SDK's 200k-series cap was reached. A run with the cap applied to every instrument (run A) did exhaust the heap: `OutOfMemoryException` and a total outage, **with no `OOMKilled` visible in Kubernetes**.
 - **The pipeline does not self-heal.** After L1–L3, Alloy kept crash-looping until the app pods restarted. Apps holding cumulative series keep re-sending huge payloads.
 - **Next:**
-  1. Fix the soak verdict so it catches transient stalls.
-  2. Record GC pauses from direct pod polling (the Prometheus path was lost with the agent).
-  3. **Repeat L4** to confirm it's reproducible.
-  4. Then **step labels back down** to find the way back to normal.
+  1. Run L4 hypothesis 2–3 more times to measure how often the outage happens.
+  2. And/or L5 (80% load, 20 min, constrained), where there's less CPU headroom.
+  3. Only once degradation is reliable: step labels back down.
 
 ---
 
@@ -37,7 +33,7 @@ It has two parts, and they're tested separately:
 | Part | Question | Status |
 |---|---|---|
 | **A** | Does cardinality create back pressure on the metrics pipeline (agent)? | ✅ Reproduced (L1, L2) |
-| **B** | Does that back pressure degrade the live app? | ✅ **Reproduced at L4** (constrained agent): a 10s outage of all replicas. One run so far; repeat pending. ❌ Not with the normal agent (L1–L3) |
+| **B** | Does that back pressure degrade the live app? | ⚠️ **Intermittent.** A 10s outage of all replicas in the first L4 run (constrained agent); **not reproduced** in the L4 repeat. ❌ Never with the normal agent (L1–L3) |
 
 ## 2. Setup
 
@@ -75,7 +71,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 | **L1** ✅ | 60% (1,400 req/s) | 10 min | + `response_time` | normal |
 | **L2** ✅ | 60% (1,400 req/s) | 10 min | + 3 unique GUID labels | normal |
 | **L3** ✅ | 70% (1,650 req/s) | 15 min | + 5 unique GUID labels | normal |
-| **L4** 🎯 | 70% (1,650 req/s) | 15 min | + 5 unique GUID labels | constrained (250m CPU / 384 Mi + memory_limiter) |
+| **L4** ⚠️ ×2 | 70% (1,650 req/s) | 15 min | + 5 unique GUID labels | constrained (250m CPU / 384 Mi + memory_limiter) |
 | L5 | 80% (1,900 req/s) | 20 min | + 5 unique GUID labels | constrained |
 
 **Rule:** if the app stays healthy (verdict NOT CONFIRMED or PARTIAL), the level passes and the next one runs.
@@ -170,6 +166,23 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 
 **Why all 4 at once.** Reset everything restarted all replicas together, so their 10s export timers and series growth are aligned. A production rollout lines pods up the same way.
 
+### L4 repeat (identical settings)
+
+| | Repeat control (bounded) | **Repeat hypothesis** |
+|---|---|---|
+| Requests | 1,485,017 ok, 0 failed, worst 1-s p95 **377 ms** (a spike with no metrics pressure) | 1,485,001 ok, **0 failed**, worst 1-s p95 128 ms |
+| Degradation / stall | none | **none** |
+| p95 early → late | 62 → 68 ms | 62 → 63 ms |
+| App CPU early → late | 2.81 → 2.73 cores | 2.75 → 2.73 cores |
+| Pod throttling early → late | **17% → 11%** (noisier than the first control's 4% → 3%) | 13% → 6% |
+| .NET heap (peak) | 40 MiB | 97 → **477 MiB, then flat** |
+| **GC pause (direct polls, new)** | peak 1.5%, 16 gen2 | **peak 3.2%**, avg 0.14%, 35 gen2 |
+| Export pressure | none | began at t=51s; peak 8,017 ms, **330 failures / 56 retries**, 200k points / 66.4 MB |
+| Alloy (constrained) | 374 MiB, 0 refused | **refused up to 18,619 points/s**, OOMKilled 6× |
+| Verdict | healthy | NOT CONFIRMED (control found and clean; no degradation) |
+
+**Reading the two L4 pairs together.** The pipeline side reproduced exactly: the same failures, retries, refusals, OOMKills and heap. The app outage did not. GC was negligible in the repeat. Both the repeat control and the first hypothesis run show that these 3-CPU nodes see bursts of CPU contention with or without metrics pressure. The first outage is therefore best described as **metrics pressure coinciding with (and possibly amplifying) a contention burst**, not a deterministic effect at this level.
+
 ### L1 → L4 trend (hypothesis runs)
 
 | | L1 | L2 | L3 | **L4** |
@@ -182,7 +195,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 | Alloy | OOMKilled 4× | OOMKilled 5× | OOMKilled 4× + crash loop | **refusing 10.7k pts/s**, then OOMKilled 6× |
 | Peak app heap | 153 MiB | 383 MiB | 476 MiB (83%) | 488 MiB (85%) |
 | Peak pod throttling (direct polls) | 52% | 56% | 100% | 95% (cAdvisor 33–64% during the stall) |
-| **App p95 / client errors** | flat / 0 | flat / 0 | flat / 0 | **3,000 ms / 2,205 timeouts** |
+| **App p95 / client errors** | flat / 0 | flat / 0 | flat / 0 | **3,000 ms / 2,205 timeouts** (first run); flat / 0 (repeat) |
 
 ### L1 → L2: what the GUID labels changed
 
@@ -242,15 +255,16 @@ Possibly relevant to the 2 clusters × 75 pods with degraded response times:
 
 ## 8. Next steps
 
-1. **Fix the soak verdict** to catch transient stalls. The rule should be: any degradation milestone during a soak, plus export pressure that started first, plus contention, plus no load saturation, **plus a clean control at the same level**, means CONFIRMED.
-2. **Record GC pause % and gen2 collections in the driver's direct pod polls.** The Prometheus copies of those metrics are lost when the agent fails.
-3. **Repeat L4** (constrained agent) at least once, to show the outage is reproducible.
-4. **Then step labels back down** with the same L4 settings, re-running after each step, to find the way back to normal:
-   1. `response_time` 6 → 3 → 2 → 1 dp → off
-   2. GUID labels 5 → 3 → 0 (or pooled values)
-   3. then `pod`, if needed
+Pick-up notes, cluster state and the open decisions are in [next-steps.md](next-steps.md).
 
-   Use **Reset everything** before each run.
+1. ~~Fix the soak verdict~~ **Done.** A degradation during a soak, with export pressure first, contention, no load saturation, **and a clean control at the same rate, duration and agent**, now means CONFIRMED. Stored runs can be re-analyzed (`POST /api/runs/{id}/reanalyze`). Re-analysis: L4 → CONFIRMED; L1–L3 unchanged; the ramp false positive (run C) is no longer CONFIRMED.
+2. ~~Record GC pauses~~ **Done.** The driver now records GC pause % and gen2 collections in its direct pod polls, and reports chart them. That applies from the next run.
+3. ~~Repeat L4~~ **Done: not reproduced** (0 errors). The effect on the app is intermittent at this level.
+4. **Next experiments**, to tell whether the effect is real or chance:
+   - **More repeats of L4 hypothesis** (2–3 more) to estimate how often the outage happens.
+   - **L5** (80% load = 1,900 req/s, 20 min, constrained). Less CPU headroom (≈15%) makes any metrics overhead more likely to show.
+   - **Isolate the environment**: pin Prometheus off the app nodes, or give the nodes more CPU. This reduces background contention bursts, so any remaining effect can be attributed to the metrics.
+   - **Only once degradation is reliable**, step labels back down (`response_time` precision 6 → 3 → 2 → 1 → off, then the GUID labels) to find the way back to normal.
 5. **Optional:**
    - L5 (80% load, 20 min)
    - stagger pod starts to test the "synchronized pods" effect
@@ -263,7 +277,9 @@ All reports are in `./reports/` (gitignored). Refresh them with `make reports`, 
 
 | Run | Report file |
 |---|---|
-| **L4 hypothesis** | `reports/20261114-193930-l4-hypothesis-1650-req-s-15m-constrained.html` |
+| L4 repeat hypothesis | `reports/20261114-203146-l4-repeat-hypothesis-1650-req-s-15m-cons.html` |
+| L4 repeat control | `reports/20261114-201541-l4-repeat-control-1650-req-s-15m-constra.html` |
+| **L4 hypothesis** (outage) | `reports/20261114-193930-l4-hypothesis-1650-req-s-15m-constrained.html` |
 | L4 control | `reports/20261114-192325-l4-control-1650-req-s-15m-constrained-ag.html` |
 | L3 hypothesis | `reports/20261114-190418-l3-hypothesis-1650-req-s-15m-normal-agen.html` |
 | L3 control | `reports/20261114-184305-l3-control-1650-req-s-15m-normal-agent.html` |
