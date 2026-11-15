@@ -68,7 +68,7 @@ static class Api
                         MetricStreamConfiguration config = instrument.Name == TransactionMetrics.DurationName
                             ? new ExplicitBucketHistogramConfiguration
                             {
-                                Boundaries = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+                                Boundaries = TransactionMetrics.DurationBoundaries,
                             }
                             : new MetricStreamConfiguration();
 
@@ -305,7 +305,8 @@ sealed class VirtualPods
     {
         var parts = realPodName.Split('-');
         _prefix = parts.Length >= 3 ? string.Join('-', parts[..^1]) : "transactions-api-local";
-        _names = Enumerable.Range(0, Math.Max(1, count)).Select(_ => NewName()).ToArray();
+        // VIRTUAL_PODS=1 is the production-like setting: the pod label is this replica's own name.
+        _names = count <= 1 ? [realPodName] : Enumerable.Range(0, count).Select(_ => NewName()).ToArray();
         if (churnEvery > TimeSpan.Zero)
         {
             _churnTimer = new Timer(_ => Churn(), null, churnEvery, churnEvery);
@@ -332,6 +333,11 @@ sealed class VirtualPods
 sealed class TransactionMetrics
 {
     public const string MeterName = "Transactions.Api";
+    // Histogram buckets (seconds), shaped around where this app's latencies and percentiles actually are
+    // (p50 ≈ 35 ms, p95 ≈ 63 ms): fine resolution from 25 to 100 ms, then coarse out to the 3 s timeout.
+    // The earlier [5, 10, 25, 50, 100, 250 ms, …] put p95 and p99 inside one 50–100 ms bucket and
+    // overstated p95 by ~40% (89 vs 63 ms). Same bucket count as before (11 boundaries).
+    public static readonly double[] DurationBoundaries = [0.01, 0.025, 0.04, 0.05, 0.06, 0.07, 0.08, 0.1, 0.25, 1, 3];
     public const string TransactionsName = "http.transactions";
     public const string DurationName = "http.transaction.duration";
 

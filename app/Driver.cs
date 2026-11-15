@@ -200,6 +200,7 @@ sealed class LoadTest
     private string _modeAtStart = "?"; // human-readable label set at the start of the run
     private LabelConfig _labelsAtStart = Labels.ForMode("bounded");
     private string _agentProfile = "unknown";
+    private FleetStats? _fleetAtStart;
     private Milestone? _degraded, _firstTimeout, _errors5, _errors50;
 
     public LoadTest(IConfiguration cfg, ReplicaMonitor replicas, PipelineMonitor pipeline, RunStore store,
@@ -256,10 +257,11 @@ sealed class LoadTest
                 : current;
             _modeAtStart = Labels.Describe(_labelsAtStart);
             _agentProfile = _pipeline.AgentProfile;
+            _fleetAtStart = _config.DryRun ? null : _pipeline.Fleet;
             var name = (c.Name ?? "").Trim();
             _name = name.Length > 0 ? name[..Math.Min(80, name.Length)]
                 : _config.DryRun ? "Dry run"
-                : $"{(Labels.IsHighCardinality(_labelsAtStart) ? "high-cardinality" : "bounded")} · {_agentProfile} agent · {_config.StartRate}→{_config.MaxRate} req/s";
+                : $"{(Labels.IsHighCardinality(_labelsAtStart) ? "high-cardinality" : "bounded")} · {_agentProfile} agent{(_fleetAtStart is { Pods: > 0 } fl ? $" · fleet {fl.Pods}" : "")} · {_config.StartRate}→{_config.MaxRate} req/s";
             _notes = string.IsNullOrWhiteSpace(c.Notes) ? null : c.Notes.Trim()[..Math.Min(2000, c.Notes.Trim().Length)];
             _state = "running";
             _cts = new CancellationTokenSource();
@@ -445,6 +447,7 @@ sealed class LoadTest
         {
             await Task.Delay(TimeSpan.FromSeconds(cfg.DryRun ? 5 : 25));
             var record = BuildRecord(cfg);
+            if (record.FleetPods > 0) record.FleetEnd = await _pipeline.ReadFleetAsync(CancellationToken.None);
             record.Evidence = await _evidence.CollectAsync(record, _replicas.Latest);
             (record.Headline, record.Findings) = Analyzer.Analyze(record, FindControl(record));
             _store.Save(record, ReportRenderer.Render(record));
@@ -465,16 +468,21 @@ sealed class LoadTest
         return record.Headline;
     }
 
-    // The most recent bounded-label run at the same constant rate and duration on the same agent profile:
-    // the control a high-cardinality soak should be compared against.
+    // The control a soak should be compared against: the most recent run at the same constant rate and
+    // duration on the same agent profile, without the simulated fleet, and
+    //  - for a fleet run: with the same labels on the real replicas (the fleet is the only difference);
+    //  - for a high-cardinality run: with bounded labels (the labels are the only difference).
     private RunSummary? FindControl(RunRecord r)
     {
-        if (!Labels.IsHighCardinality(new LabelConfig(r.Labels, r.ResponseTimeDecimals, r.Mode.Contains("GUID") ? 1 : 0, 0)) || r.Config.StartRate != r.Config.MaxRate)
-            return null;
-        return _store.Summaries().FirstOrDefault(s => !s.DryRun && s.Id != r.Id
-            && !s.Labels.Contains("response_time") && !s.Mode.Contains("GUID")
+        if (r.Config.StartRate != r.Config.MaxRate) return null;
+        bool Comparable(RunSummary s) => !s.DryRun && s.Id != r.Id && s.FleetPods == 0
             && s.MaxTargetRate == r.Config.MaxRate && Math.Abs(s.DurationSeconds - r.Config.StepSeconds) <= 15
-            && s.AgentProfile == r.AgentProfile);
+            && s.AgentProfile == r.AgentProfile;
+        if (r.FleetPods > 0)
+            return _store.Summaries().FirstOrDefault(s => Comparable(s) && s.Mode == r.Mode);
+        if (!Labels.IsHighCardinality(new LabelConfig(r.Labels, r.ResponseTimeDecimals, r.Mode.Contains("GUID") ? 1 : 0, 0)))
+            return null;
+        return _store.Summaries().FirstOrDefault(s => Comparable(s) && !s.Labels.Contains("response_time") && !s.Mode.Contains("GUID"));
     }
 
     private RunRecord BuildRecord(TestConfig cfg)
@@ -492,6 +500,8 @@ sealed class LoadTest
                 Labels = _labelsAtStart.Labels ?? [],
                 ResponseTimeDecimals = _labelsAtStart.ResponseTimeDecimals ?? 6,
                 AgentProfile = _agentProfile,
+                FleetPods = _fleetAtStart?.Pods ?? 0,
+                FleetStart = _fleetAtStart,
                 DryRun = cfg.DryRun,
                 Config = cfg,
                 StartedAtUnix = _startedTs,
@@ -880,6 +890,27 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
     private readonly string _grafanaAuth = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(
         $"{cfg["GRAFANA_USER"] ?? "admin"}:{cfg["GRAFANA_PASSWORD"] ?? "admin"}"));
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(4) };
+    private readonly string _fleetDns = cfg["FLEET_DNS"] ?? "transactions-fleet-headless.demo.svc.cluster.local";
+
+    // Simulated fleet (transactions-fleet replicas), summed over its replicas. Null when it isn't running.
+    public FleetStats? Fleet { get; private set; }
+
+    public async Task<FleetStats?> ReadFleetAsync(CancellationToken ct)
+    {
+        IPAddress[] ips;
+        try { ips = await Dns.GetHostAddressesAsync(_fleetDns, ct); }
+        catch (System.Net.Sockets.SocketException) { return null; } // no fleet pods
+        var parts = await Task.WhenAll(ips.Select(async ip =>
+        {
+            try { return await _http.GetFromJsonAsync<FleetStats>($"http://{ip}:8080/admin/stats", Json.Options, ct); }
+            catch (Exception ex) when (!ct.IsCancellationRequested) { log.LogDebug(ex, "fleet stats from {Ip}", ip); return null; }
+        }));
+        var ok = parts.Where(p => p is not null).Select(p => p!).ToList();
+        if (ok.Count == 0) return null;
+        return new FleetStats(ok.Sum(p => p.Pods), ok[0].RatePerPod, ok[0].ResponseTime, ok[0].ExtraSeries, ok[0].ChurnSeconds,
+            ok.Sum(p => p.Exports), ok.Sum(p => p.ExportFailures), ok.Sum(p => p.HttpRetries),
+            ok.Max(p => p.MaxLastExportMs), ok.Max(p => p.PointsPerPod), ok.Sum(p => p.Churned));
+    }
 
     // End-to-end checks for the dry run: app -> OTLP -> Alloy -> remote_write -> Prometheus -> Grafana.
     public async Task<List<Check>> RunChecksAsync()
@@ -952,6 +983,8 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
     {
         while (!ct.IsCancellationRequested)
         {
+            try { Fleet = await ReadFleetAsync(ct); }
+            catch (Exception ex) when (!ct.IsCancellationRequested) { Fleet = null; log.LogDebug(ex, "fleet poll failed"); }
             try { await PollAsync(ct); }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -993,6 +1026,7 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
             prometheus = new { memory = promMem, limit = promLimit, restarts = promRestarts, node = promNode },
             alloy = new { memory = alloyMem, limit = alloyLimit, cpu = alloyCpu, cpuLimit = alloyCpuLimit, refusedPerSec = alloyRefused, profile = AgentProfile, protectPrometheus = ProtectPrometheus },
             nodeMemoryPct = nodes,
+            fleet = Fleet,
         };
         lock (_history)
         {

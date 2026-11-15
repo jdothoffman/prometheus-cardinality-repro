@@ -9,15 +9,19 @@
   - Each replica then sends 35–67 MB per export, every 10s.
   - Exports time out and retry, and Alloy is OOMKilled 4–6 times per run.
   - App heap reaches 83–85% of its GC limit.
-- **Getting there:** that pressure degrading the live app. **2 of 3 constrained-agent hypothesis runs degraded, and every control was clean.**
+- **Shown:** that pressure causes resource contention on the live app. **CPU throttling was higher than control in 3 of 3 L5 runs. Latency stalls were intermittent: 2 of 5 constrained-agent runs.** Every control was clean.
 
   | Level | Load | Hypothesis result | Control |
   |---|---|---|---|
   | L4 | 70% | 10 s outage, 2,205 timeouts | clean |
   | L4 repeat | 70% | no degradation | clean (some noise) |
-  | **L5** | **80%** | **2 s stall** (p95 1,340 ms, 0 errors). Late-run throttling 42% vs 33% and p95 87 vs 63 ms. | clean |
+  | **L5** | **80%** | **2 s stall** (p95 1,340 ms, 0 errors). Late-run throttling 42% vs 33%. | clean |
+  | L5 repeat 1 | 80% | p95 bump to 497 ms; throttling 51% | (same control) |
+  | L5 repeat 2 | 80% | no latency effect; throttling 42% | (same control) |
+  | **L5 F1 fix** | 80% | same bad labels, dropped by the SDK View: **everything at control level** (throttling 31%) | (same control) |
+  | **L5 F5 band** | 80% | `response_time` as 5 bands, no GUIDs: **healthy** (2× control points, 0 export failures) | (same control) |
 
-  The degradation is consistent but small. A *stall*, and a lasting slowdown, are shown. A reliable *outage* is not.
+  CPU contention is systematic. Latency impact is intermittent. A reliable *outage* is not shown. **The allow-list fix (F1) removes the contention entirely.**
 - **Ruled out as the main cause:** GC (at most 3.2% pause).
 - **Still possible:** background CPU contention in the cluster. A control run alone showed throttling bursts.
 
@@ -31,7 +35,7 @@
 | App | 4 replicas, `CPU_WORK_ITERATIONS=1000` (≈ 2,350 req/s capacity), bounded labels |
 | Run history | On the driver's PVC (survives restarts). HTML copies are in `./reports/` (gitignored). |
 | Node CPUs | App nodes at **4 CPUs** since L5 (`APP_NODE_CPUS=4 make node-cpus`). This is not the Makefile default of 3, so pass the variable again if you re-create the cluster. |
-| Git | `docs/` changes after PR #7 (L5 results, [proving-the-fix.md](proving-the-fix.md)) are uncommitted. |
+| Git | L5 repeat and F1 results in `docs/` are uncommitted (after PR #8). |
 
 ## Resume
 
@@ -56,7 +60,17 @@ If the CPU caps on the nodes were lost (check with `docker inspect k3d-cardinali
 
 ### 1. Which experiment next? (main decision)
 
-> **Update after L5:** option C (more CPU per app node) is done, and L5 is done. **Recommended next: two more L5 hypothesis runs** (≈ 22 min each; L5 control can be reused). Run them as a single **Run hypothesis** in the console, or repeat that click. If at least one degrades, L5 meets the "≥2 of 3" bar, and you can move on to the fix runs in [proving-the-fix.md](proving-the-fix.md).
+> **Update after the L5 repeats and F1:**
+> - **Done:** the L5 repeats and F1.
+> - **Result:** contention 3 of 3, latency stalls 1 of 3. The "≥2 of 3" bar is met for *contention* but not for *stalls*.
+> - **The fix:** F1 removes everything.
+> - **Recommended next:**
+>   1. ~~F5 (latency band label)~~ **Passed:** about 2× control points, 0 export failures, no app impact.
+>   2. Better histogram buckets: the current ones overstate p95 (89 ms against 63 ms).
+>   3. F3 step-down, if you want to know which precision is "safe".
+>   4. Bring the production questions (decision 5) to the observability team.
+>
+> **Earlier update after L5:** option C (more CPU per app node) is done, and L5 is done. **Recommended next: two more L5 hypothesis runs** (≈ 22 min each; L5 control can be reused). Run them as a single **Run hypothesis** in the console, or repeat that click. If at least one degrades, L5 meets the "≥2 of 3" bar, and you can move on to the fix runs in [proving-the-fix.md](proving-the-fix.md).
 
 Original options (2026-11-14):
 

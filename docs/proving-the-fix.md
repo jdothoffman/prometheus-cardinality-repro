@@ -119,15 +119,33 @@ Each run is the hypothesis preset at that level, plus a fix knob. All knobs alre
 
 Compare against the hypothesis run at the same level and against its control. The fix passes when all of these hold:
 
-| Signal | Hypothesis (L5, today) | Fixed means |
-|---|---|---|
-| Export payload per replica | 67 MB, 200k points | at control level, ≈1.2 MB / 8k points |
-| Export failures / retries | 452 / 45 | 0 / 0 |
-| Alloy | OOMKilled 5×, refusing 11k points/s | no restarts, 0 refused |
-| App .NET heap (peak) | 482 MiB of 576 MiB | at control level, ≈40 MiB |
-| Pod throttling, late quarter | 42% | within a few points of control (33%) |
-| p95, late quarter | 87 ms | within a few ms of control (63 ms) |
-| Stalls / client errors | p95 1,340 ms stall, 0 errors | none |
+| Signal | Hypothesis (L5, 3 runs) | Fixed means | **F1 result** |
+|---|---|---|---|
+| Export payload per replica | 66–67 MB, 200k points | at control level, ≈1.2 MB / 8k points | ✅ 1.2 MB / 8.2k |
+| Export failures / retries | 452–455 / 45–68 | 0 / 0 | ✅ 0 / 0 |
+| Alloy | refusing 10.6–11.2k points/s, 0–5 restarts | no restarts, 0 refused | ✅ healthy |
+| App .NET heap (peak) | 477–482 MiB of 576 MiB | at control level, ≈40 MiB | ✅ 41 MiB |
+| Pod throttling, late quarter | 42–51% | within a few points of control (33%) | ✅ 31% |
+| p95, late quarter | 64–87 ms | within a few ms of control (63 ms) | ✅ 63 ms |
+| Stalls / client errors | 1 stall (p95 1,340 ms), 0 errors | none | ✅ none |
+
+**F5 passed** (run `20261115-134526`):
+
+- **What the app added:** `response_time` as 5 fixed bands, with no GUID labels.
+- **Export:** 15.8k points / 2.8 MB, about 2× control, because only the `0-50ms` and `50-250ms` bands occur at normal latency. There were 0 export failures, and Alloy was healthy with brief refusals of up to 882 points/s.
+- **App:** heap 49 MiB, throttling 30 → 21%, p95 63 ms, 0 client failures.
+- **Caveat:** `PROTECT_PROM` drops any series with a `response_time` label, so the Prometheus cost of the band series wasn't measured here. By the arithmetic it's about 2× the bounded series, and at most 5× under heavy degradation.
+
+**F1 passed on every signal** (run `20261115-132242`, 2026-11-15). The code still added `response_time`(6dp) and 5 unique GUID labels; the SDK View (`OTEL_ALLOWED_TAGS=consume_type,state,product,pod`) dropped them before export.
+
+### Histogram accuracy: buckets matter
+
+In F1, the server-side histogram's p95 read **89 ms**, while the true client-side p95 was **63 ms** (p50: 34 ms against 37 ms, which is fine). The current boundaries are `5, 10, 25, 50, 100, 250 ms…`. 22% of requests sit in the single 50–100 ms bucket, and interpolation inside it overestimates p95 and p99.
+
+- **Lesson:** a histogram keeps the latency signal at fixed cost, but **place the boundaries where your percentiles and SLOs are**. For example: `25, 50, 60, 75, 100, 150, 250, 500 ms, 1, 2.5, 5 s`.
+- **Alternative:** use exponential histograms, which adapt their resolution automatically.
+- **Stability:** the histogram was rock-steady (88.3–88.8 ms all run), so even coarse buckets work for trends and alerting. They're just imprecise in absolute terms.
+- **Suggested follow-up:** re-run F1 with SLO-shaped buckets and check that the p95 lands within a few ms of the driver's.
 
 For F3, record each step's numbers. The first precision at which every signal is at control level is the "safe" setting, and the answer to "which labels can we keep?"
 

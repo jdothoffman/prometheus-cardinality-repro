@@ -501,7 +501,8 @@ function renderPipeline(p) {
     <div>Agent (Alloy) profile</div><div><span class="tag ${al.profile === 'constrained' ? 'warn' : 'ok'}">${esc(al.profile)}</span></div>
     <div>Alloy memory</div><div>${fmtB(al.memory)} / ${fmtB(al.limit)}${pct(al.memory, al.limit)}</div>
     <div>Alloy CPU</div><div>${fmtN(al.cpu, 2)} / ${al.cpuLimit ? fmtN(al.cpuLimit, 2) : 'no limit'} cores</div>
-    <div>Alloy refusing</div><div>${al.refusedPerSec ? `<span class="tag bad">${fmtN(al.refusedPerSec)} points/s</span>` : '0'}</div>`;
+    <div>Alloy refusing</div><div>${al.refusedPerSec ? `<span class="tag bad">${fmtN(al.refusedPerSec)} points/s</span>` : '0'}</div>
+    <div>Simulated fleet</div><div>${p.fleet && p.fleet.pods ? `<span class="tag warn">${fmtN(p.fleet.pods)} pods</span> · rt ${esc(p.fleet.responseTime)} · ${fmtN(p.fleet.exportFailures)} export failures` : 'off'}</div>`;
   for (const [node, v] of Object.entries(p.nodeMemoryPct || {}).sort()) {
     html += `<div class="mono">${node.replace('k3d-', '')}</div><div>${fmtN(v, 0)}%<div class="bar"><span style="width:${Math.min(100, v)}%;background:${v > 85 ? css('--bad') : css('--accent')}"></span></div></div>`;
   }

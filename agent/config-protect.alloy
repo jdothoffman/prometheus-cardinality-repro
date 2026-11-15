@@ -48,6 +48,13 @@ prometheus.relabel "protect_prometheus" {
     regex         = ".+"
     action        = "drop"
   }
+  // Simulated fleet pods (transactions-fleet, otel_scope_name "Transactions.Api.sim.<pod>"): Alloy receives
+  // and converts all of them, but the small local Prometheus doesn't have to store 300 pods' series.
+  rule {
+    source_labels = ["otel_scope_name"]
+    regex         = "Transactions\\.Api\\.sim\\..*"
+    action        = "drop"
+  }
   forward_to = [prometheus.remote_write.prometheus.receiver]
 }
 

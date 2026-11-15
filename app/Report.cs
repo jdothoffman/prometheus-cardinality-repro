@@ -69,6 +69,11 @@ sealed class RunRecord
     public string[] Labels { get; set; } = [];
     public int ResponseTimeDecimals { get; set; } = 6;
     public string AgentProfile { get; set; } = "unknown";
+    // Simulated pods (transactions-fleet) sending to the same agent during the run, and their export
+    // counters at start and end. 0 / null for runs without the fleet.
+    public int FleetPods { get; set; }
+    public FleetStats? FleetStart { get; set; }
+    public FleetStats? FleetEnd { get; set; }
     public bool DryRun { get; set; }
     public TestConfig Config { get; set; } = new();
     public long StartedAtUnix { get; set; }
@@ -89,7 +94,7 @@ sealed class RunRecord
 
 sealed record RunSummary(string Id, string Name, string StartedAt, string Mode, string[] Labels, string AgentProfile, bool DryRun, long DurationSeconds,
     int MaxTargetRate, int PeakOkPerSec, Milestone? Degraded, Milestone? FirstTimeout, Milestone? Errors5,
-    Milestone? Errors50, string? StopReason, string Headline, int ChecksPassed, int ChecksTotal);
+    Milestone? Errors50, string? StopReason, string Headline, int ChecksPassed, int ChecksTotal, int FleetPods = 0);
 
 static class Json
 {
@@ -166,7 +171,7 @@ sealed class RunStore
         r.Points.Count == 0 ? 0 : r.Points.Max(p => p.Ok),
         r.Milestones.GetValueOrDefault("degraded"), r.Milestones.GetValueOrDefault("firstTimeout"),
         r.Milestones.GetValueOrDefault("errors5"), r.Milestones.GetValueOrDefault("errors50"),
-        r.StopReason, r.Headline, r.Checks.Count(c => c.Ok), r.Checks.Count);
+        r.StopReason, r.Headline, r.Checks.Count(c => c.Ok), r.Checks.Count, r.FleetPods);
 
     public static string MakeId(long startedAtUnix, string name)
     {
@@ -871,7 +876,9 @@ static class Analyzer
                 // Control at the same rate, duration and agent profile with bounded labels.
                 var controlClean = control is not null && control.Degraded is null && control.FirstTimeout is null && control.Errors5 is null;
                 var controlText = control is null
-                    ? "No matching control run found (same rate, duration and agent, bounded labels): run one to rule out the environment. "
+                    ? (r.FleetPods > 0
+                        ? "No matching control run found (same rate, duration, agent and labels, without the fleet): run one to rule out the environment. "
+                        : "No matching control run found (same rate, duration and agent, bounded labels): run one to rule out the environment. ")
                     : controlClean ? $"Control \"{control.Name}\" at the same rate/duration/agent had no degradation and no errors. "
                     : $"Control \"{control.Name}\" also degraded, so the environment/load explains it, not the labels. ";
                 if (control is not null)
@@ -950,6 +957,22 @@ static class Analyzer
         else
             f.Add(new("warn", "Prometheus unavailable when the report was generated", ev.PrometheusError ?? "unknown error"));
         if (ev.KubeError is not null) f.Add(new("info", "Kubernetes evidence unavailable", ev.KubeError));
+
+        // 7. Simulated fleet sharing the agent.
+        if (r.FleetPods > 0 && r.FleetEnd is { } fe)
+        {
+            var fs = r.FleetStart;
+            var exports = fe.Exports - (fs?.Exports ?? 0);
+            var failures = fe.ExportFailures - (fs?.ExportFailures ?? 0);
+            var retries = fe.HttpRetries - (fs?.HttpRetries ?? 0);
+            var failPct = exports > 0 ? 100.0 * failures / exports : 0;
+            f.Add(new(failPct >= 5 ? "warn" : "info", $"Fleet: {r.FleetPods:N0} simulated pods shared the agent",
+                $"Besides the {r.Evidence.Pods.Count} real replicas, {r.FleetPods:N0} simulated pods each pushed their own OTLP export " +
+                $"(response_time: {fe.ResponseTime}, {fe.ExtraSeries:N0} extra series, up to {fe.PointsPerPod:N0} points per pod per export" +
+                (fe.ChurnSeconds > 0 ? $", ~20% of pods replaced every {fe.ChurnSeconds}s ({fe.Churned:N0} so far)" : "") + "). " +
+                $"During the run: {exports:N0} fleet exports, {failures:N0} failed ({failPct:N1}%), {retries:N0} HTTP retries. " +
+                "Fleet series are dropped before Prometheus by the PROTECT_PROM rule; Alloy still receives and converts all of them."));
+        }
 
         var order = new[] { "critical", "warn", "info", "ok" };
         f = f.OrderBy(x => Array.IndexOf(order, x.Severity)).ToList();
@@ -1112,7 +1135,7 @@ const mrow = (label, m) => `<tr><td>${label}</td><td>${m ? n(m.rate) + ' req/s' 
 const c = R.config;
 let html = `
   <h1>${esc(R.name)}</h1>
-  <div class="sub">${esc(when(R.startedAtUnix))} · ${T(R.points.length ? R.points[R.points.length - 1].t : 0)} · labels: <b>${esc(R.mode)}</b> · agent: <b>${esc(R.agentProfile)}</b>${R.dryRun ? ' · dry run' : ''} · run id <span style="font-family:var(--mono)">${esc(R.id)}</span></div>
+  <div class="sub">${esc(when(R.startedAtUnix))} · ${T(R.points.length ? R.points[R.points.length - 1].t : 0)} · labels: <b>${esc(R.mode)}</b> · agent: <b>${esc(R.agentProfile)}</b>${R.fleetPods ? ` · fleet: <b>${n(R.fleetPods)} simulated pods</b>` : ''}${R.dryRun ? ' · dry run' : ''} · run id <span style="font-family:var(--mono)">${esc(R.id)}</span></div>
   ${R.notes ? `<p>${esc(R.notes)}</p>` : ''}
   <div class="panel headline ${sevOf}"><div class="k">Most likely cause</div><div class="v">${esc(R.headline)}</div>
     <div class="muted" style="margin-top:4px">Stop reason: ${esc(R.stopReason || '–')}</div></div>
@@ -1169,6 +1192,7 @@ let html = `
     <div>Driver in-flight cap</div><div>${n(c.maxInFlight)}</div>
     <div>Labels on http_transactions_total</div><div>${esc(R.mode)}</div>
     <div>Agent profile</div><div>${esc(R.agentProfile)}</div>
+    <div>Simulated fleet</div><div>${R.fleetPods ? n(R.fleetPods) + ' pods sharing the agent' : 'none'}</div>
     <div>OTel cardinality limit</div><div>${(R.evidence.pods || [])[0] ? n(R.evidence.pods[0].cardinalityLimit) : '–'}</div>
   </div>
   <footer>Generated by transactions-driver at ${esc(when(R.endedAtUnix))}. Self-contained file: the raw run data is embedded in this page.</footer>`;

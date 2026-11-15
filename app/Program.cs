@@ -4,15 +4,21 @@
 //   driver            the load-test console: home page with Start/Stop, ramps the transaction
 //                     rate against the api Service, measures latency/timeouts/errors, and polls
 //                     each api replica and Prometheus to show where resources run out.
+//   fleet             simulated pods (see Fleet.cs): many independent OTLP senders with production-style
+//                     labels, so the agent sees a 300-pod fleet while only 4 real replicas are measured.
 // The driver runs as its own Deployment so generating load never steals CPU from the pods under test.
 
 var builder = WebApplication.CreateBuilder(args);
-var isDriver = string.Equals(builder.Configuration["APP_ROLE"], "driver", StringComparison.OrdinalIgnoreCase);
+var role = (builder.Configuration["APP_ROLE"] ?? "api").Trim().ToLowerInvariant();
 
-if (isDriver) Driver.Configure(builder); else Api.Configure(builder);
+if (role == "driver") Driver.Configure(builder);
+else if (role == "fleet") Fleet.Configure(builder);
+else Api.Configure(builder);
 
 var app = builder.Build();
 
-if (isDriver) Driver.Map(app); else Api.Map(app);
+if (role == "driver") Driver.Map(app);
+else if (role == "fleet") Fleet.Map(app);
+else Api.Map(app);
 
 app.Run();
