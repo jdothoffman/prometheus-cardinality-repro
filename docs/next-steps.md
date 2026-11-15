@@ -1,6 +1,6 @@
 # Next steps: picking up the experiment
 
-**Updated:** 2026-11-15 (evening), after the L5 runs, fix runs F1 and F5, [the independent review](review-2026-11-15.md), the 300-pod fleet test and the 40-minute L5 pair. Results and evidence are in [experiment-log.md](experiment-log.md). The fix plan is in [proving-the-fix.md](proving-the-fix.md).
+**Updated:** 2026-11-15 (night), after the L5 runs, fix runs F1 and F5, [the independent review](review-2026-11-15.md), the 300-pod fleet test and the 40-minute L5 pair, with the run-A sweep under way. Results and evidence are in [experiment-log.md](experiment-log.md). The fix plan is in [proving-the-fix.md](proving-the-fix.md).
 
 ## Where we are
 
@@ -47,15 +47,14 @@ Mean throttling across pods, t=420–960: bounded runs 9.8 / 9.3 / 12.6% (L5 con
 |---|---|
 | k3d cluster `cardinality` | Running, with a 5th node: `k3d-fleetpool-0` (tainted `pool=fleet`, 1.75 GB, 2 CPUs) for the simulated fleet |
 | Agent profile | **constrained + protect** (Alloy 250m CPU / 384 MiB, memory_limiter). Drops `response_time`/GUID series **and the simulated fleet's series** before Prometheus |
-| Real replicas | 4 replicas, `CPU_WORK_ITERATIONS=1000` (≈ 2,350 req/s capacity), **`VIRTUAL_PODS=50`** again: `make app` re-applies the manifest, which resets `make prod-pods`. Run `make prod-pods` before the next fleet test |
+| Real replicas | 4 replicas, `CPU_WORK_ITERATIONS=1000` (≈ 2,350 req/s capacity). **`VIRTUAL_PODS=1`** for the run-A sweep (`make lab-pods` restores 50 for the L1–L5 presets; `make app` also resets it to 50, because it re-applies the manifest). The sweep script restores `OTEL_CARDINALITY_LIMIT=200000` / scope `transactions` when it finishes |
 | Fleet | `make fleet-on` / `make fleet-off` (2 × 150 = 300 pods). **Off** after the P300 pair |
 | Histogram buckets | Reshaped around real latencies (`10, 25, 40, 50, 60, 70, 80, 100, 250 ms, 1, 3 s`) from the fleet build on |
 | Node CPUs | App nodes at **4 CPUs** (`APP_NODE_CPUS=4 make node-cpus`), not the Makefile default of 3 |
 | Run history | On the driver's PVC. HTML copies are in `./reports/` (`make reports`, gitignored) |
-| Git | PR #9 merged. PR #10 (this branch): the P300 results and the 40-minute pair |
+| Git | PRs #9–#11 merged. The run-A sweep's criteria and results go in the next docs PR |
 | Deployed build | `main` after PR #9: export-failure-reason recording, appended-labels knob, robust report statistics, churn fix (deployed 2026-11-15 15:16 UTC and verified: `/admin/stats` now has `exportFailureReasons` and `appendedLabels`). The first `make app` attempt failed silently in `k3d image import`; running it again worked |
-| Alloy | `restartCount` 5 since the 40-min hypothesis run (OOMKilled during its first 4 minutes, idle since). "Reset everything" restarts it before the next run |
-| Real replicas' SDK state | Still holding the 40-min hypothesis run's 200k series and 480 MiB heap each, and dropping every export (payload > 64 MiB). "Reset everything" (part of every prepared run) restarts them |
+| Alloy, replicas' SDK state | Restarted by each prepared run of the sweep |
 
 ## Resume
 
@@ -89,10 +88,11 @@ Ask the observability team, or check the code and config:
 **Recommended order:**
 
 1. ~~Finish the P300 pair~~ **Done** (experiment log, section 4b): no app effect.
-2. **Run-A sweep: the cardinality limit by itself.** The strongest remaining production candidate, it needs no bad label, and this version needs no production facts (about 1 hour of cluster time). Run A showed that a limit of 200k on every instrument reserves about 560 MiB at startup. The sweep maps the whole curve so production's value can be read off it once known.
-   - **Settings:** bounded labels, constrained + protect agent, 4 replicas, `VIRTUAL_PODS=50`. `OTEL_CARDINALITY_LIMIT_SCOPE=all` with `OTEL_CARDINALITY_LIMIT` at **2,000 (the SDK default), 10,000, 50,000, 100,000 and 200,000**: `kubectl --context k3d-cardinality -n demo set env deploy/transactions-api OTEL_CARDINALITY_LIMIT=<n> OTEL_CARDINALITY_LIMIT_SCOPE=all`, then a prepared run (which restarts the pods). Restore with `OTEL_CARDINALITY_LIMIT=200000 OTEL_CARDINALITY_LIMIT_SCOPE=transactions` afterwards.
-   - **Measure:** the idle heap after startup (direct polls, `/admin/stats`) against the 576 MiB GC limit; then a 10-minute soak at 1,900 req/s per value, with the usual report. The controls are the existing bounded runs (scope `transactions`, idle heap 26 MiB).
-   - **Criteria, to be written into the log before the first run:** a value *fails* if its soak has client errors, a stall (5 s or more over 100 ms) or pod restarts with exit `Error`; otherwise it *costs* the idle heap it reserves. Expected: heap grows linearly with the limit (run A: 560 MiB ÷ 200k ≈ 2.9 KB per unit of limit across the ~30 instruments), and the app fails somewhere between 100k and 200k.
+2. **Run-A sweep: the cardinality limit by itself. Running since 19:28 UTC on 2026-11-15** (about 80 min). The strongest remaining production candidate, it needs no bad label, and this version needs no production facts. Run A showed that a limit of 200k on every instrument reserves about 560 MiB at startup. The sweep maps the whole curve so production's value can be read off it once known.
+   - **Settings** (final version in [experiment-log.md](experiment-log.md), section 4c): bounded labels, constrained + protect agent, 4 replicas, **`VIRTUAL_PODS=1`** (own pod name, as in production; about 160 series per instrument, so no value overflows and only the limit changes). `OTEL_CARDINALITY_LIMIT_SCOPE=all` with `OTEL_CARDINALITY_LIMIT` at **2,000 (the SDK default), 10,000, 50,000, 100,000 and 200,000**: `kubectl --context k3d-cardinality -n demo set env deploy/transactions-api OTEL_CARDINALITY_LIMIT=<n> OTEL_CARDINALITY_LIMIT_SCOPE=all`, then a prepared run (which restarts the pods). Restore with `OTEL_CARDINALITY_LIMIT=200000 OTEL_CARDINALITY_LIMIT_SCOPE=transactions` afterwards.
+   - **Measure:** the idle heap after startup (direct polls, `/admin/stats`) against the 576 MiB GC limit; then a 10-minute soak at 1,900 req/s per value, with the usual report. The control is a 10-minute run with the repo's usual setting (200k on `http.transactions` only), made first in the same sweep.
+   - **Criteria and predictions:** written into the log (section 4c) at 19:27 UTC, before the first run. A value *fails* on client errors, a stall (5 s or more over 100 ms), a pod restart or `OutOfMemoryException`; otherwise it *costs* the heap it reserves, plus any throttling or p95 change beyond the noise floor. Predicted: heap linear in the limit (about 2.8 KB per unit), 2k–50k pass, 200k fails, 100k is the open case.
+   - **Why this before the production facts:** it is the one remaining experiment whose result doesn't depend on them, and it turns the first fact we get (the limit) straight into an answer. Its 2k row also covers the other branch: if production never raised the limit, each instrument is capped at 2,000 series per pod, and neither run A nor a label explosion inside the SDK can be the cause.
    - **Output:** a table *limit → idle heap, soak result*. Once production's value is known, it is read off the table, and the exact re-test with production's settings follows.
 3. ~~Deploy PR #9's recording~~ **Done.** The next runs say *why* exports fail.
 4. **Size the fleet and agent from production figures** (series per pod, Alloy limits), and add the appended labels production uses (`make appended-labels N=…`).
@@ -109,7 +109,7 @@ Ask the observability team, or check the code and config:
 
 ### 4. Housekeeping
 
-- Merge PR #10.
-- Delete the merged branches, local and remote: `feature/fleet-sim`, `feature/latency-band`, `feature/stall-verdict-gc`, `features/docsupdate`.
+- Delete the merged branches, local and remote: `feature/fleet-sim`, `feature/latency-band`, `feature/stall-verdict-gc`, `features/docsupdate`, `docs/p300-results`.
+- `make cap-app` / `make uncap-app` set the limit but not its scope. A `make limit N=… SCOPE=…` target would make the sweep repeatable without `kubectl set env`.
 - Report tooling: take "App heap (peak)" from the direct polls, not Prometheus (it showed 56 MiB against 480 MiB once the pod's exports were being dropped). Add node-level CPU and pressure metrics to the report, for the next stall.
 - When the experiment is over, use `make down` to delete the cluster. `k3d cluster stop cardinality` only stops it.

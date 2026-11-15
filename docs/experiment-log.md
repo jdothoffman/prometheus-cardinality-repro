@@ -40,7 +40,7 @@
 - **Histogram accuracy:** the old buckets put p95 at 89 ms against a true 63 ms. The buckets are now shaped around real latencies (section 4b).
 - **Next:** see [next-steps.md](next-steps.md):
   1. get the production facts (cardinality limit, series per pod, appended labels, Alloy limits, exporter version, pods whose series went stale)
-  2. the run-A sweep (needs no facts), then re-test run A with production's settings
+  2. the run-A sweep (running, section 4c; needs no facts), then re-test run A with production's settings
   3. size the fleet and agent from production figures, then repeat P300
 
 ## How we recreated it, and how it shows impact on the running app
@@ -161,7 +161,7 @@ It has two parts, and they're tested separately:
 | Part | Question | Status |
 |---|---|---|
 | **A** | Does cardinality create back pressure on the metrics pipeline (agent)? | ✅ Reproduced (L1, L2) |
-| **B** | Does that back pressure degrade the live app? | ⚠️ **The app is affected, but not through back pressure.** Its cost comes from the SDK's own state: heap about 480 MiB, throttling +1–4 points (mean across pods), median p95 +1 ms. Stalls in 1 of 2 L4 runs and 2 of 3 L5 runs. The agent was crashed or idle during each stall. ❌ No stall with the normal agent (L1–L3, confounded by lower load). ✅ Removed by fix F1 |
+| **B** | Does that back pressure degrade the live app? | ⚠️ **The app is affected, but not through back pressure.** Its cost comes from the SDK's own state: heap about 480 MiB, throttling +1–4 points (mean across pods), median p95 +1 ms. Stalls in 1 of 2 L4 runs and 2 of 4 L5 runs (none in the 40-minute run). The throttling and p95 shifts are within the noise of three bounded runs. The agent was crashed or idle during each stall. ❌ No stall with the normal agent (L1–L3, confounded by lower load). ✅ Removed by fix F1 |
 
 ## 2. Setup
 
@@ -554,6 +554,31 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 
 **What it leaves open:** why the production app got slow. The candidates still standing are a raised `CardinalityLimit` (run A), and large per-pod SDK state from appended labels or high-resolution histograms. Both are about what each pod holds, which is what the production facts in [next-steps.md](next-steps.md) are meant to establish.
 
+## 4c. Run-A sweep: the cardinality limit by itself (2026-11-15)
+
+**Why:** run A (section 5) showed that `OTEL_CARDINALITY_LIMIT=200000` applied to *every* instrument made the SDK reserve about 560 MiB, 97% of the GC heap, before any traffic arrived. The app then failed with `OutOfMemoryException` and no `OOMKilled`. That needs no bad label, which makes it the strongest remaining candidate for production. The sweep maps the whole curve, so production's limit can be read off it once known.
+
+**Criteria and predictions, written at 19:27 UTC on 2026-11-15, before the first run (19:28).**
+
+**Settings, the same for every run:**
+
+- **Labels:** bounded (`consume_type, state, product, pod`), and **`VIRTUAL_PODS=1`** (`make prod-pods`): each replica stamps only its own pod name, as production does. That gives about 160 series per instrument, below even the SDK's default limit of 2,000, so no value in the sweep overflows and the only thing that changes is the limit.
+- **Load and agent:** 1,900 req/s (80% of capacity), **10 minutes** each, constrained + protect agent, 4 replicas, app nodes at 4 CPUs. Each run is a prepared run ("Reset everything" restarts the pods, which keep the environment set below).
+- **The limit:** `OTEL_CARDINALITY_LIMIT_SCOPE=all` (every instrument: the app's, ASP.NET Core's and the runtime's, about 30) with `OTEL_CARDINALITY_LIMIT` at **2,000** (the SDK default), **10,000**, **50,000**, **100,000** and **200,000**, in that order.
+- **Control:** first, the repo's usual setting (`OTEL_CARDINALITY_LIMIT=200000` on `http.transactions` only), same labels, rate and duration.
+- **Measured:** the idle heap of each replica 60 s after the limit is applied, before load (direct `/admin/stats` polls), against the 576 MiB GC heap limit (75% of the 768 MiB container limit); then the report of each soak. Statistics with `tools/report-stats.py --windows 120-600`.
+
+**A value fails** if its soak has any client errors, a stall (5 s or more over 100 ms after warm-up), a pod restart, or `OutOfMemoryException` in the pod logs. **A value has a steady-state cost** if the mean throttling across pods or the median p95 over t=120–600 is outside the noise floor measured in section 4 (3 points of throttling, 0.5 ms of median p95: the spread of three bounded runs) compared with the sweep's control. The report's automated verdict looks for "a control" by labels and duration, so for these runs it may pick the previous sweep value; it is not used here.
+
+**Predictions:**
+
+- Idle heap grows **linearly** with the limit: about 2.8 KB per unit (run A: 560 MiB ÷ 200,000 across about 30 instruments), on top of about 26 MiB. So about 32 MiB at 2k, 55 MiB at 10k, 160 MiB at 50k, 300 MiB at 100k and **about 580 MiB at 200k, at or over the GC limit**.
+- **200k fails**, as in run A, probably at startup or within the first minute of load.
+- **2k–50k pass** with no steady-state cost.
+- **100k:** the open case. It should start with about 270 MiB of headroom. If it costs anything, it will show as more GC time (gen2 collections must walk the reserved storage) and, from that, throttling or p95.
+
+**Results:** to follow.
+
 ## 5. Earlier runs and what they taught us
 
 | Run | What happened | Lesson |
@@ -610,7 +635,7 @@ Pick-up notes, cluster state and the open decisions are in [next-steps.md](next-
 
 1. ~~Finish the P300 pair~~ **Done: no effect on the app; agent overwhelmed; monitoring dark.** (section 4b)
 2. **Get the production facts:** the cardinality limit settings, series per pod, the bucketing form, the appended labels and where they're added, and Alloy's limits and replicas. Then size the fleet and agent from them.
-3. **Run-A sweep, then the re-test with production's real cardinality limit settings.** The sweep (`OTEL_CARDINALITY_LIMIT_SCOPE=all` at 2k, 10k, 50k, 100k, 200k; idle heap, then a 10-minute soak each) needs no production facts and gives the table production's value is read off. Plan and criteria: [next-steps.md](next-steps.md), decision 2. It needs no bad label and doesn't show as `OOMKilled`.
+3. **Run-A sweep (running; section 4c), then the re-test with production's real cardinality limit settings.** The sweep (`OTEL_CARDINALITY_LIMIT_SCOPE=all` at 2k, 10k, 50k, 100k, 200k; idle heap, then a 10-minute soak each) needs no production facts and gives the table production's value is read off. It needs no bad label and doesn't show as `OOMKilled`.
 4. ~~Deploy the export-failure-reason recording~~ **Done: the ~35 ms failures are the SDK dropping exports over its 64 MiB request limit before sending** (section 4, "L5 × 40 min").
 5. ~~One longer L5 hypothesis and a second L5 control~~ **Done: no stall in 40 minutes; the steady-state CPU effect is within the noise floor of three bounded runs; median p95 at most 1 ms higher.**
 6. **L5 with the normal agent**, to separate agent profile from load level.
