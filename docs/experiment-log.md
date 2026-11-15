@@ -1,9 +1,10 @@
 # Experiment log: metrics pressure vs the live app
 
-**Date:** 2026-11-14 · **Environment:** local k3d cluster (this repo) · **Status (revised 2026-11-15 after [an independent review](review-2026-11-15.md)):** L1–L5 complete, L4 ×2, L5 ×3, fix runs F1 and F5 done, and a 300-pod fleet test under way. **Production already buckets response time**, so the float `response_time` label is not the production cause. The suspect is now the pod and appended labels (section 4b). **In this repo the app-side cost comes from each pod's own SDK state (about 200k series), not from agent back pressure. It is small in steady state, with latency stalls in 2 of 5 constrained-agent runs. F1 removes it.**
+**Date:** 2026-11-14 · **Environment:** local k3d cluster (this repo) · **Status (revised 2026-11-15 after [an independent review](review-2026-11-15.md)):** L1–L5 complete, L4 ×2, L5 ×3, fix runs F1 and F5 done, and a 300-pod fleet test done. **Production already buckets response time**, so the float `response_time` label is not the production cause. The suspect is now the pod and appended labels (section 4b). **In this repo the app-side cost comes from each pod's own SDK state (about 200k series), not from agent back pressure. It is small in steady state, with latency stalls in 2 of 5 constrained-agent runs. F1 removes it.**
 
 ## TL;DR
 
+- **300-pod fleet test (section 4b): agent overload alone does not slow the app.** With 300 simulated pods sharing the constrained agent, Alloy refused up to 97k points/s and OOMKilled 6×, 98% of the fleet's exports failed, and the real replicas' metrics went dark for about 18 of 20 minutes. The real replicas' own exports failed and retried for the whole run (1,204 retries, 8 s timeouts). The app: 0 failures, heap 35 MiB, throttling and p95 at control level. **The cost of cardinality to the app is the size of the SDK's own state, not the back-pressure path.** Agent overload costs visibility, not latency.
 - **Production pivot (2026-11-15).** Production already buckets response time. The float `response_time` label studied in L1–L5 is therefore *not* the production cause, although it remains a clear way to reproduce high-cardinality damage. The remaining suspects:
   - the `pod` label and the labels the observability team appends
   - a raised `CardinalityLimit` across many instruments (run A)
@@ -37,10 +38,10 @@
 - **Run A remains a strong production candidate.** The OTel cardinality limit applied to every instrument made the SDK reserve **about 560 MiB, 97% of the GC heap, at startup**. The result was `OutOfMemoryException`, a total outage, and **no `OOMKilled` in Kubernetes**. It needs no bad label at all.
 - **Histogram accuracy:** the old buckets put p95 at 89 ms against a true 63 ms. The buckets are now shaped around real latencies (section 4b).
 - **Next:** see [next-steps.md](next-steps.md):
-  1. finish the 300-pod pair
-  2. get the production facts (cardinality limit, series per pod, appended labels, Alloy limits)
-  3. re-test run A with those settings
-  4. a longer L5 with a second control
+  1. get the production facts (cardinality limit, series per pod, appended labels, Alloy limits)
+  2. re-test run A with those settings
+  3. a longer L5 with a second control
+  4. size the fleet and agent from production figures, then repeat P300
 
 ## How we recreated it, and how it shows impact on the running app
 
@@ -426,7 +427,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 - **Histogram buckets retuned** around the real latencies: `10, 25, 40, 50, 60, 70, 80, 100, 250 ms, 1, 3 s`. This keeps the same bucket count and fixes the 89-against-63 ms p95 overstatement.
 - **Prometheus:** the `PROTECT_PROM` agent configs also drop the simulated pods' series (by `otel_scope_name`) before Prometheus. Alloy still receives and converts all of them.
 - **Reports:** they record the fleet size. A fleet run's control is the same labels on the real replicas, with no fleet.
-- **Added after the review (built, deployed after the P300 pair):**
+- **Added after the review (deployed 2026-11-15 15:16 UTC, after the P300 pair):**
   - **Why exports fail.** Each failed HTTP attempt is recorded by outcome: `HTTP <code>` (the request reached the agent), `timeout / cancelled`, `connection: <error>`, or "not sent" (the export failed before any HTTP request). This applies to the real replicas and to the fleet, in reports and in `/admin/stats`.
   - **Appended identity labels** (`make appended-labels N=4`): 0–8 labels such as `k8s_node_name`, `k8s_pod_uid` and `container_id`, added to every series on the real replicas (`APPENDED_LABELS`) and the fleet (`FLEET_APPENDED_LABELS`). One value per pod, so they make series heavier without multiplying them. This models labels the observability team appends. Re-run it after `make fleet-on`, which re-applies the manifest.
   - **Reports** show throttling as the worst pod *and* the mean across pods, p95 as the mean *and* the median, and Alloy restarts from the Kubernetes `restartCount`.
@@ -437,7 +438,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 - About 55% of fleet exports failed.
 - **The real replicas' metrics stopped reaching Prometheus too.** Aggregate overload blinds monitoring for *every* pod, not only the ones causing it.
 
-**Runs:** the P300 control (no fleet) and the P300 fleet run, at 1,900 req/s for 20 min with the constrained agent. Results to follow.
+**Runs:** the P300 control (no fleet) and the P300 fleet run, at 1,900 req/s for 20 min with the constrained agent. Results are below the criteria.
 
 **Criteria, written down at 14:30 UTC on 2026-11-15, before the fleet run started.** This follows section 6.1 of [review-2026-11-15.md](review-2026-11-15.md). The fleet run is compared with the P300 control, which has the same labels on the real replicas and no fleet.
 
@@ -455,6 +456,38 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
   - The constrained agent (250m / 384 MiB) is far below the about 17k points/s that 300 pods × about 580 points send every 10 s. This run can only show that an undersized agent is overwhelmed.
   - Appended labels aren't modelled.
   - The fleet's series are dropped before Prometheus.
+
+### P300 results (2026-11-15, 14:27–15:09 UTC)
+
+**Verdict against the criteria: no effect on the app. The prediction held.** The agent was overwhelmed and monitoring went dark for every pod, including the 4 real replicas, while the app served every request.
+
+| | P300 control (no fleet) | **P300 fleet (300 simulated pods)** |
+|---|---|---|
+| Requests | 2,280,005 ok, 0 failed, worst 1-s p95 236 ms (a 7 s blip at t=606–612) | 2,280,001 ok, **0 failed**, worst 1-s p95 292 ms (4 s above 100 ms at t=575–580) |
+| Seconds at p95 ≥ 1 s | 0 | **0** |
+| Throttling, mean across pods, t=420–960 / t=1030–1200 | 12.6 / 15.1% | **11.0 / 13.4%** (below control) |
+| Throttling, worst pod, late quarter | 42% | 32% |
+| Per-pod CPU, t=420–960 | 0.795 | 0.790 |
+| Late p95, median | 63.0 ms | **62.8 ms** |
+| App heap (peak) | 35 MiB | **35 MiB** |
+| GC pause peak | 4.2% | 1.0% |
+| Real replicas' exports | 533 points / 116 KB, 0 failures, max 46 ms | 539 points / 117 KB, **464 failures, 1,204 retries**, mean 1.3–1.6 s, peak 8,017 ms (the timeout) |
+| Fleet exports during the run | — | 36,881 sent, **36,143 failed (98.0%)**, 92,719 HTTP retries, 569 points per pod |
+| Alloy | healthy; 46 points/s refused at t<30 (leftover from switching the fleet off) | memory_limiter engaged at 340–357 MiB of 384 MiB for about 10 min, **refusing 56k–95k points/s** (peak 96,670) and accepting about 0; then **OOMKilled, 6 restarts**; its own metrics stopped at t≈690 |
+| Real replicas' metrics reaching Prometheus | throughout | **only about t=600–780** (a short window after an Alloy restart). Dark for about 18 of 20 minutes |
+| Fleet series in Prometheus | — | none (the drop rule works) |
+| Report verdict | healthy; NOT CONFIRMED | NOT CONFIRMED ("export cost grew but did not affect the app"); headline "Alloy restarted during the run"; control found and clean |
+
+**What this shows:**
+
+1. **Agent overload by itself does not slow the app**, at least not under these OTel .NET semantics with small per-pod state. The real replicas' exports spent the whole run failing, timing out at 8 s and retrying 1,204 times, which is exactly the back-pressure path the original hypothesis described. With about 540 points per export, it cost nothing measurable: the heap stayed at 35 MiB and CPU, throttling and latency matched the control. Combined with review 3.4, that settles it: **the cost of cardinality to the app is the size of the SDK's own state, not the retry or back-pressure path.**
+2. **Agent overload costs visibility, for everyone.** 98% of the fleet's exports and almost all of the real replicas' exports were lost. In production this would look like dashboards going blank for the whole service, not like slow requests. If the production symptom was *slow requests*, agent overload alone doesn't explain it.
+3. **Retries multiply the agent's inbound load.** The fleet offered about 17k points/s (300 × 569 points per 10 s), but Alloy was refusing 56k–95k points/s, because `in_memory` retries re-offered the same payloads about 5 times over. A refusing agent plus client retries is a feedback loop on the agent, even when it's harmless to the apps.
+4. **Scale check.** The constrained agent (250m CPU / 384 MiB) is a deliberately undersized stand-in. 300 pods × about 570 points is a small fleet by production standards, and this agent couldn't take it. Sizing the agent and the fleet from production figures (series per pod, Alloy limits and replica count) is the next step before this test says anything about production's agent.
+
+**First reading of the new failure-reason counters** (15:17 UTC, fleet still on, Alloy in CrashLoopBackOff after 7 OOMKills): every export from the real replicas and from the fleet failed as **`timeout / cancelled`** after the full 8 s. A Service whose only pod is crash-looping has no ready endpoints, so connections hang instead of being refused. Each export then occupies the background export thread for 8 of every 10 seconds, waiting on the network, not on CPU. The 35 ms failures seen in the L4/L5 runs are a different case, and will be classified the next time a high-cardinality run is made.
+
+**What it leaves open:** why the production app got slow. The candidates still standing are a raised `CardinalityLimit` (run A), and large per-pod SDK state from appended labels or high-resolution histograms. Both are about what each pod holds, which is what the production facts in [next-steps.md](next-steps.md) are meant to establish.
 
 ## 5. Earlier runs and what they taught us
 
@@ -507,7 +540,7 @@ Possibly relevant to the 2 clusters × 75 pods with degraded response times:
 
 Pick-up notes, cluster state and the open decisions are in [next-steps.md](next-steps.md). In order:
 
-1. **Finish the P300 pair** (section 4b) and judge it against the criteria written down before the run.
+1. ~~Finish the P300 pair~~ **Done: no effect on the app; agent overwhelmed; monitoring dark.** (section 4b)
 2. **Get the production facts:** the cardinality limit settings, series per pod, the bucketing form, the appended labels and where they're added, and Alloy's limits and replicas. Then size the fleet and agent from them.
 3. **Re-test run A with production's real cardinality limit settings.** It needs no bad label and doesn't show as `OOMKilled`.
 4. **Deploy the export-failure-reason recording** and find out why exports fail in about 35 ms while Alloy counts nothing.
@@ -535,6 +568,8 @@ All reports are in `./reports/` (gitignored). Refresh them with `make reports`, 
 
 | Run | Report file |
 |---|---|
+| **P300 fleet** (300 simulated pods) | `reports/20261115-144847-p300-fleet-300-simulated-pods-1900-req-s.html` |
+| P300 control (no fleet) | `reports/20261115-142737-p300-control-no-fleet-1900-req-s-20m-con.html` |
 | **L5 F5 latency band** | `reports/20261115-134526-l5-f5-latency-band-hypothesis-1900-req-s.html` |
 | **L5 F1 allow-list fix** | `reports/20261115-132242-l5-f1-allow-list-fix-hypothesis-1900-req.html` |
 | L5 repeat 2 hypothesis | `reports/20261115-130130-l5-repeat-2-hypothesis-1900-req-s-20m-co.html` |

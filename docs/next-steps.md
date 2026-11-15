@@ -13,9 +13,11 @@
   - **Cost to the app:** clear in **heap** (about 480 MiB against 40 MiB), small in **CPU** (+1–4 points of mean throttling across pods, about 1 ms of median p95), and **intermittent stalls**: L4 1 of 2, L5 2 of 3, both L5 stalls starting at t=973 for unknown reasons.
   - **Mechanism:** the app's cost comes from the **SDK's own state**, not agent back pressure. The agent was crash-looping or idle during every stall.
   - **Fixes:** F1 (SDK allow-list View) removes everything. F5 (latency bands) is safe.
-- **300-pod fleet test (running):** 300 simulated pods with production-style labels (own pod name, bucketed response time) share the agent with the 4 real replicas.
-  - **Before any load:** the constrained agent refused about 29k points/s, about 55% of fleet exports failed, and **the real replicas' metrics stopped reaching Prometheus**.
-  - **Prediction, written down before the run:** the app is unaffected.
+- **300-pod fleet test: done. Agent overload alone does not slow the app.** 300 simulated pods (own pod name, bucketed response time) shared the constrained agent with the 4 real replicas.
+  - **Agent:** refused up to 97k points/s, OOMKilled 6×. 98% of fleet exports failed. The real replicas' metrics were dark for about 18 of 20 minutes.
+  - **App:** 0 failures, heap 35 MiB, throttling and p95 at control level, even though its own exports failed and retried the whole run (1,204 retries at the 8 s timeout).
+  - **Conclusion:** the cost of cardinality to the app is the size of the SDK's own state. Agent overload costs visibility, not latency. Retries multiplied the agent's inbound load about 5×.
+  - The prediction written down before the run held.
 
 ## Scorecard
 
@@ -28,7 +30,8 @@
 | L5 repeat 2 | 80% | no stall | (same control) |
 | **L5 F1 fix** | 80% | same bad labels, dropped by the SDK View: **everything at control level** | (same control) |
 | **L5 F5 band** | 80% | `response_time` as 5 bands: **healthy** | (same control) |
-| P300 control / fleet | 80% | running | (pair) |
+| P300 control (no fleet) | 80% | clean (worst p95 236 ms, 0 errors) | — |
+| **P300 fleet** (300 pods) | 80% | **no app effect** (0 errors, heap 35 MiB, p95 at control); agent refused up to 97k pts/s, OOMKilled 6×; 98% of fleet exports lost | clean |
 
 Mean throttling across pods, t=420–960: control 9.8%, hypothesis runs 10.9 / 11.2 / 14.1%, F1 10.7%, F5 8.6%. Median late p95: 62.6 ms against 63.6–63.7 ms. There is only one control, so a few points is within noise.
 
@@ -38,13 +41,14 @@ Mean throttling across pods, t=420–960: control 9.8%, hypothesis runs 10.9 / 1
 |---|---|
 | k3d cluster `cardinality` | Running, with a 5th node: `k3d-fleetpool-0` (tainted `pool=fleet`, 1.75 GB, 2 CPUs) for the simulated fleet |
 | Agent profile | **constrained + protect** (Alloy 250m CPU / 384 MiB, memory_limiter). Drops `response_time`/GUID series **and the simulated fleet's series** before Prometheus |
-| Real replicas | 4 replicas, `CPU_WORK_ITERATIONS=1000` (≈ 2,350 req/s capacity), **`VIRTUAL_PODS=1`** (`make prod-pods`; `make lab-pods` restores 50 for the L1–L5 presets) |
-| Fleet | `make fleet-on` / `make fleet-off` (2 × 150 = 300 pods). Started by the P300 pair; turn it off when done |
+| Real replicas | 4 replicas, `CPU_WORK_ITERATIONS=1000` (≈ 2,350 req/s capacity), **`VIRTUAL_PODS=50`** again: `make app` re-applies the manifest, which resets `make prod-pods`. Run `make prod-pods` before the next fleet test |
+| Fleet | `make fleet-on` / `make fleet-off` (2 × 150 = 300 pods). **Off** after the P300 pair |
 | Histogram buckets | Reshaped around real latencies (`10, 25, 40, 50, 60, 70, 80, 100, 250 ms, 1, 3 s`) from the fleet build on |
 | Node CPUs | App nodes at **4 CPUs** (`APP_NODE_CPUS=4 make node-cpus`), not the Makefile default of 3 |
 | Run history | On the driver's PVC. HTML copies are in `./reports/` (`make reports`, gitignored) |
-| Git | PR #9 (fleet simulator, review additions, these docs): open, awaiting approval |
-| Not yet deployed | Export-failure-reason recording, appended-labels knob, robust report statistics, churn fix. They're in PR #9; deploy with `make app` after the P300 pair finishes |
+| Git | PR #9 merged. P300 results are the next docs PR |
+| Deployed build | `main` after PR #9: export-failure-reason recording, appended-labels knob, robust report statistics, churn fix (deployed 2026-11-15 15:16 UTC and verified: `/admin/stats` now has `exportFailureReasons` and `appendedLabels`). The first `make app` attempt failed silently in `k3d image import`; running it again worked |
+| Alloy | Restarted clean after the fleet was switched off |
 
 ## Resume
 
@@ -75,9 +79,9 @@ Ask the observability team, or check the code and config:
 
 **Recommended order:**
 
-1. **Finish the P300 pair** and judge it against the criteria written down before the run (experiment log, section 4b).
+1. ~~Finish the P300 pair~~ **Done** (experiment log, section 4b): no app effect.
 2. **Re-test run A with production's cardinality-limit settings.** This is the strongest remaining production candidate, and it needs no bad label.
-3. **Deploy PR #9's recording**, so the next runs say *why* exports fail.
+3. ~~Deploy PR #9's recording~~ **Done.** The next runs say *why* exports fail.
 4. **Size the fleet and agent from production figures** (series per pod, Alloy limits), and add the appended labels production uses (`make appended-labels N=…`).
 5. **One 40-minute L5 hypothesis plus a second L5 control,** to see whether the t=973 event recurs on a period, and to measure noise.
 6. **L5 with the normal agent,** to separate agent profile from load level.
