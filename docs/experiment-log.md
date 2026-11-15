@@ -4,6 +4,7 @@
 
 ## TL;DR
 
+- **40-minute L5 pair (section 4, "L5 × 40 min"): no stall in either run, and the export failures are explained.** The hypothesis run carried 200k series and a 480 MiB heap per pod for 40 minutes with **0 failed requests, a worst 1-second p95 of 77 ms**, and throttling inside the spread of the controls. The t=973 stall did not recur: **2 of 4 hypothesis runs stalled; no bounded run went above 236 ms.** From minute 6 on, every export was **dropped by the OTel SDK before sending**, because the payload passed the OTLP exporter's **64 MiB `MaxRequestSizeBytes`**. That is the "35 ms failure" of L4/L5, and it silently took the pod's *own* metrics (heap, GC, requests) out of Prometheus for the last 34 minutes while Alloy sat idle. With three bounded runs to compare against, the labels' steady-state CPU effect at 80% load is **within noise**, and the median p95 effect is at most about 1 ms. The reliable app-side costs are **memory** and **going dark**.
 - **300-pod fleet test (section 4b): agent overload alone does not slow the app.** With 300 simulated pods sharing the constrained agent, Alloy refused up to 97k points/s and OOMKilled 6×, 98% of the fleet's exports failed, and the real replicas' metrics went dark for about 18 of 20 minutes. The real replicas' own exports failed and retried for the whole run (1,204 retries, 8 s timeouts). The app: 0 failures, heap 35 MiB, throttling and p95 at control level. **The cost of cardinality to the app is the size of the SDK's own state, not the back-pressure path.** Agent overload costs visibility, not latency.
 - **Production pivot (2026-11-15).** Production already buckets response time. The float `response_time` label studied in L1–L5 is therefore *not* the production cause, although it remains a clear way to reproduce high-cardinality damage. The remaining suspects:
   - the `pod` label and the labels the observability team appends
@@ -17,16 +18,16 @@
   - **Alloy was OOMKilled 4–6 times per run**, on both the normal (1 GiB) and constrained profiles.
 - **Cost to the app: real, but small in steady state.**
   - **Heap:** 477–488 MiB (83–85% of the GC limit), against about 40 MiB in controls.
-  - **Throttling (mean across pods):** about 10% in the control, against 11–14% in the hypothesis runs before t=960.
+  - **Throttling (mean across pods):** 9.3–12.6% across three bounded runs, against 10.8–14.1% in the four hypothesis runs (t=420–960). Within noise.
   - **Per-pod CPU:** within 1–2% of control.
-  - **Median p95:** about 1 ms higher.
+  - **Median p95:** 0–1 ms higher (62.5–63.1 ms in bounded runs, 62.8–63.6 ms in hypothesis runs).
   - The earlier "+9 to +18 points of throttling" and "+24 ms p95" were the worst pod and the stall averaged in (review 3.1–3.2).
 - **Latency stalls: intermittent.**
   - **L4 first run:** a 10 s outage with 2,205 timeouts.
-  - **L5:** 2 of 3 runs stalled, and both stalls **began at the same second (t=973)**, with a trigger not yet identified (review 3.3).
+  - **L5:** 2 of 4 runs stalled, both **beginning at the same second (t=973)**. The 40-minute hypothesis run and both controls were clean, so the trigger isn't periodic, and it isn't identified (review 3.3, 40-min pair).
   - **No stalls in any control, in F1 or in F5.**
 - **Mechanism, corrected.** The agent was **not** pushing back when the app stalled.
-  - **L5 runs:** Alloy accepted and refused nothing after about t=105–385. Its memory was flat at about 50 MiB, and the app's exports failed in about 35 ms.
+  - **L5 runs:** Alloy accepted and refused nothing after about t=105–385 and sat at about 50 MiB, because the app's exports **never left the pod**: the SDK dropped each 200k-point payload as larger than its 64 MiB request limit (verified by the failure reasons recorded in the 40-min run).
   - **L4 outage:** Alloy was crash-looping.
   - **What every app-side effect shares:** each pod holding about 200k series and a 460 MiB heap, and collecting them every 10 s. That is the cost of cardinality inside the SDK (review 3.4).
 - **Fix F1 proven (SDK allow-list View, `make fix-app`).** The app *still adds* `response_time` and 5 GUIDs, but the View drops them before export. Every signal returned to control level:
@@ -38,10 +39,9 @@
 - **Run A remains a strong production candidate.** The OTel cardinality limit applied to every instrument made the SDK reserve **about 560 MiB, 97% of the GC heap, at startup**. The result was `OutOfMemoryException`, a total outage, and **no `OOMKilled` in Kubernetes**. It needs no bad label at all.
 - **Histogram accuracy:** the old buckets put p95 at 89 ms against a true 63 ms. The buckets are now shaped around real latencies (section 4b).
 - **Next:** see [next-steps.md](next-steps.md):
-  1. get the production facts (cardinality limit, series per pod, appended labels, Alloy limits)
+  1. get the production facts (cardinality limit, series per pod, appended labels, Alloy limits, exporter version, pods whose series went stale)
   2. re-test run A with those settings
-  3. a longer L5 with a second control
-  4. size the fleet and agent from production figures, then repeat P300
+  3. size the fleet and agent from production figures, then repeat P300
 
 ## How we recreated it, and how it shows impact on the running app
 
@@ -84,7 +84,7 @@ Each step of the chain is measured **inside the app pods**, not inferred from da
 |---|---|---|
 | Series per export | wrapped OTLP exporter (points per export) | 8.2k → **200k** points |
 | Export payload | the exporter's HTTP handler (bytes sent) | 1.2 MB → **67 MB** every 10s |
-| Agent state | exporter failures and retries; Alloy's accepted/refused points; Kubernetes restarts | 0 → **452 failures / 45 retries**. Alloy refused up to 11k points/s early, was OOMKilled 5×, then from t≈125 **accepted and refused nothing** (exports failing in about 35 ms) |
+| Agent state | exporter failures and retries; Alloy's accepted/refused points; Kubernetes restarts | 0 → **452 failures / 45 retries**. Alloy refused up to 11k points/s early, was OOMKilled 5×, then from t≈125 **accepted and refused nothing**: the SDK was dropping every export inside the pod, as larger than its 64 MiB request limit |
 | App memory | .NET GC heap, polled from each pod | 41 → **482 MiB** (84% of the GC limit) |
 | App CPU contention | the pod's cgroup `cpu.stat`: share of time throttled at its 1-core limit, **mean across pods** | 9.8% → 10.9% (t=420–960); 9.4% → 14.7% (t=1030–1200, after the stall). Per-pod CPU 0.785 → 0.787 cores |
 | Live traffic | the load driver's own clients | median late p95 **62.6 → 63.6 ms**; a **2 s stall at p95 1,340 ms** from t=973; 0 failed requests |
@@ -100,15 +100,16 @@ Each step of the chain is measured **inside the app pods**, not inferred from da
 
 **Shown:**
 
-- High-cardinality labels make the running app pay for its own metrics: **heap** clearly (about 480 MiB against 40 MiB), and **CPU** slightly (about 1–4 points of mean throttling, about 1 ms of median p95).
-- Pods carrying that state stalled in 2 of 3 L5 runs (both from t=973) and in 1 of 2 L4 runs. Controls, F1 and F5 never did.
+- High-cardinality labels make the running app pay for its own metrics: **heap** clearly (about 480 MiB against 40 MiB), and **CPU** at most slightly: the 1–4 points of mean throttling are within the spread of the bounded runs, and the median p95 is at most about 1 ms higher (40-min pair).
+- Pods carrying that state stalled in 2 of 4 L5 runs (both from t=973; not in the 40-minute run) and in 1 of 2 L4 runs. Controls, F1 and F5 never did.
+- Once a pod's export passes the SDK's 64 MiB request limit, **all** of its metrics stop arriving, silently, while the agent sits idle (40-min pair).
 - An SDK allow-list View (F1) removes all of it, even with the bad labels still in the code.
 
 **Not shown:**
 
 - **That agent back pressure causes the app's cost.** The agent was crashed or idle during every stall (review 3.4).
 - That outages are *reliable*: only one run (L4) had timeouts.
-- What triggers the t=973 stalls.
+- What triggers the t=973 stalls. A 40-minute run didn't reproduce them.
 - That any of this is what happened in production. Production already buckets response time (section 4b).
 
 **Confound:** the normal-agent levels (L1–L3) also had lower load (60–70%) and 3-CPU nodes. There is no L5-load run with the normal agent, so "agent profile decides the outcome" is not established.
@@ -331,7 +332,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 **What the stall looked like** (from the driver's 2-second pod polls):
 
 - **Before:** exports had been failing fast (about 25–80 ms) since about t=330s. Alloy was running (about 50 MiB) but **accepted and refused nothing** from t≈125 on. The reason exports fail is not yet known (now recorded; see section 4b).
-- **t=973s:** the first second above 100 ms (142 ms). **Repeat 1 also began degrading at exactly t=973** (134 ms), so this looks like a specific trigger about 16 minutes in, not chance. It is not the load driver (`sent` steady at 1,898–1,908/s), not Alloy (flat, idle), not a gen2 GC (none on any pod at t=974–987), and not the exports (latency rose before the slow exports at t=976). The trigger is unidentified.
+- **t=973s:** the first second above 100 ms (142 ms). **Repeat 1 also began degrading at exactly t=973** (134 ms), so this looks like a specific trigger about 16 minutes in, not chance. It is not the load driver (`sent` steady at 1,898–1,908/s), not Alloy (flat, idle), not a gen2 GC (none on any pod at t=974–987), and not the exports (latency rose before the slow exports at t=976). The trigger is unidentified. The 40-minute pair (below) didn't reproduce it.
 - **t≈972s:** in-flight requests rose from about 70 to 1,650.
 - **t=974–979s:** **all four replicas** were at 0.96–1.01 cores, throttled 67–96%.
 - **During the stall:** the two replicas that exported at t=976 took 1,057 ms and 1,240 ms to do it, against about 30 ms just before. The exports at t=981–985 took 480–750 ms.
@@ -367,7 +368,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 **Reading it:**
 
 - **CPU contention: consistent in direction, small in size.** Mean throttling across pods ended higher than control, F1 and F5 in all 3 hypothesis runs. But before the t=973 event the difference is 1–4 points, about the size of run-to-run drift (F5 ended 4 points *below* control). There is only one control. Most of the late-quarter difference in the first run and repeat 1 comes *after* the t=973 stall. (The report's "throttling" figure is the most-throttled pod per poll; reports now show the mean too.)
-- **Latency impact: intermittent, and both L5 stalls began at t=973.** That points to a specific trigger about 16 minutes into the run, which only hurts pods that are carrying the 200k-series state. It isn't yet identified.
+- **Latency impact: intermittent, and both L5 stalls began at t=973.** That points to a specific trigger about 16 minutes into the run, which only hurts pods that are carrying the 200k-series state. It isn't yet identified. A 40-minute hypothesis run and a second control (next subsection) were clean, so it's not periodic.
 - **Alloy restart counts:** the Prometheus-based `alloyRestartsDelta` undercounts while Alloy is down. Kubernetes records 5, 6 and 5 OOMKills. Reports now take the Kubernetes `restartCount`.
 - **F5 (latency as 5 bands, no GUIDs) is safe at this level.** Export points rose to about 2× control (15.8k; only 2 bands occur at normal latency) and the payload to 2.8 MB. There were 0 export failures and no app impact. Note that `PROTECT_PROM` drops every series carrying `response_time`, so the band series didn't reach Prometheus here. Their Prometheus cost is estimated (about 2× the bounded series), not measured.
 - **F1 is the strongest single result.** With the same bad labels still in the code, a View dropping them brings *every* signal back to control. That rules out "something else about those runs" and identifies the fix.
@@ -384,6 +385,70 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 - **What's useful anyway:** the histogram is very stable (p95 between 88.3 and 88.8 ms all run), so it's good for trends and alerts. Its absolute values are only as precise as the buckets.
 - **Cost:** 8,960 series in Prometheus: 160 label combinations × 14 (12 buckets + sum + count) × 4 replicas. Of those, 7,680 are `_bucket` series.
 
+### L5 × 40 min: does the t=973 stall recur, and how noisy is the environment? (criteria written before the run)
+
+**Written at 16:01 UTC on 2026-11-15, before the runs started.** Two runs, same settings as L5 (1,900 req/s, constrained + protect agent, app nodes at 4 CPUs, `VIRTUAL_PODS=50`), but **40 minutes** each:
+
+1. **40-min control** (bounded labels). It doubles as the second control the review asked for.
+2. **40-min hypothesis** (`response_time` 6 dp + 5 unique GUID labels). The first run on the build that records *why* exports fail.
+
+**Questions and how they'll be read:**
+
+- **Does the t=973 event recur?** Look for the first second at p95 > 100 ms after warm-up, in both runs.
+  - **In the hypothesis only, near t=973 and/or again near t≈1946 or 2919:** a periodic trigger that only hurts pods carrying the 200k-series state.
+  - **In the hypothesis only, at an unrelated time:** the stalls are real but not periodic.
+  - **In the control too, near t=973:** an environmental trigger (something on the nodes at ~16 minutes), not the labels.
+  - **Nowhere:** two previous stalls at the same second remain unexplained; at least the effect isn't reliable.
+- **Run-to-run noise:** compare the two controls' **mean throttling across pods** over matching windows (t=420–960 and t=1030–1200) and their **median p95**. The difference between controls is the noise floor; a hypothesis effect counts only if it exceeds it.
+- **Why exports fail:** the hypothesis run's "Why the app's exports failed" finding classifies the ~35 ms failures seen in L4/L5 (`HTTP <code>` vs `timeout` vs `connection`).
+- **Verdict:** the automated verdict applies as before. A CONFIRMED needs the 40-min control clean.
+
+**Results (written 17:50 UTC on 2026-11-15).** Control 16:02–16:42 UTC, hypothesis 16:43–17:23 UTC, run back to back through the prepared-run API with "Reset everything" before each. The figures come from the reports' embedded run data (`tools/report-stats.py`); windows are seconds since the run started.
+
+| | 40-min control | **40-min hypothesis** |
+|---|---|---|
+| Requests | 4,556,740 ok, 0 failed | 4,556,101 ok, **0 failed** |
+| Worst 1-second p95 | 100 ms (one second) | **77 ms** |
+| Seconds with p95 > 100 ms after warm-up | 0 | **0** |
+| Throttling, mean across pods: t=420–960 / 1030–1200 / last quarter (1815–2400) | 9.3 / 7.7 / 11.3% | 10.8 / 8.9 / **8.6%** |
+| Median p95: t=420–960 / 1030–1200 / last quarter | 63.0 / 62.6 / 62.5 ms | 62.8 / 62.9 / 63.1 ms |
+| App heap, peak (direct polls) | 37 MiB | **480 MiB** (container 530 MiB). The report's own "heap peak" shows 56 MiB, because it comes from Prometheus and the pod was dark after minute 6 |
+| GC pause, peak / average | 2 / 0% | 3.2 / 0.1% |
+| Exports per replica | 8.2k points / 1.2 MB, 0 failures, max 132 ms | 200,223 points; payload **67,018,320 B** at minute 5 (171,871 points), then **every export failed**: 935 failures / 46 retries, 50–140 ms each |
+| Why exports failed | — | **not sent (dropped before any HTTP request): 844**; timeout / cancelled: 100; HTTP 503: 23; connection: 25 |
+| Alloy | healthy, 0 restarts, 292 MiB peak | refused up to 6,690 points/s, **OOMKilled 5×** by t≈230, then **idle at 85 MiB for the remaining 36 minutes** |
+| Replicas' metrics reaching Prometheus | throughout (head series 136k) | until t≈360, then **nothing for the last 34 minutes** (head series frozen at 118k) |
+| Report verdict | no degradation; NOT CONFIRMED | NOT CONFIRMED ("export cost grew but did not affect the app"); control found and clean |
+
+**Scored against the criteria:**
+
+1. **Does the t=973 event recur? No. Nowhere.** Neither run had a single second above 100 ms after warm-up, so there is nothing near t=973, 1,946 or 2,919 in either. By the criteria: the two earlier stalls at the same second remain unexplained, and the effect isn't reliable. Across all runs at this level, **2 of 4 hypothesis runs stalled (both from t=973, peaking at 1,340 and 497 ms)**, while the five bounded runs (L5 control, F1, F5, P300 control, this control) never went above 236 ms; the P300 control's 7 s blip at t=606–612 is the longest excursion any of them had.
+2. **Run-to-run noise.** The two L5 controls (20 min and 40 min) give mean throttling of 9.8 against 9.3% at t=420–960, and 9.4 against 7.7% at t=1030–1200. The P300 control, also bounded and at the same rate (with `VIRTUAL_PODS=1`), gave 12.6 and 15.2%. So **bounded runs vary by about 3 points in the first window and 7 in the second**, and one run's windows drift by about 4 points (this control: 7.7–11.7%). The hypothesis runs' 10.8–14.1% at t=420–960 sit inside that spread, and this hypothesis run's last quarter (8.6%) came out **below** its control (11.3%). The median p95 of bounded runs spans 62.5–63.1 ms, of hypothesis runs 62.8–63.6 ms. **The steady-state CPU effect of the labels at this load is not distinguishable from noise. The median p95 effect is at most about 1 ms, at the edge of it.** The clear, repeatable app-side effect is the heap.
+3. **Why exports fail: answered, and it is the SDK, not the agent.** 844 of 992 failed attempts were "not sent": the export failed before any HTTP request. The cause is in the OpenTelemetry .NET OTLP exporter: `OtlpExporterOptions.MaxRequestSizeBytes` defaults to **64 MiB (67,108,864 B)**, and "a batch whose serialized payload exceeds this size is not sent, and is dropped in its entirety" (exporter 1.18.0 changelog; the default was 128 MiB before that). Each replica's payload reached 67,018,320 B at 171,871 points in minute 5. By minute 6, with 198k–200k points, it was over the limit. From then on, every 10 s, each replica serialized its 200k points (50–140 ms of CPU), found the request too large, and dropped it: the counter, the histogram **and the runtime metrics** (heap, GC) in the same batch. That is why Alloy sat idle at 85 MiB while the app counted a failure every 10 s, what the "35 ms failures" of L4/L5 were, and why the replicas were dark in Prometheus for 34 minutes. The other 148 failures (timeouts, 503s, connection errors) all fall in the first five minutes, while Alloy was OOM-looping. Alloy's own `max_request_body_size` was never involved: the requests never left the pod.
+4. **Verdict:** NOT CONFIRMED by the report's rule, with a clean 40-min control. That is the right call: nothing happened to the app's requests.
+
+**Where the earlier runs sit** (same rate and agent; windows as above, computed with `tools/report-stats.py`, so a figure may differ by 0.1 from one quoted earlier; the t=1030–1200 window of the two stalled runs includes the stall's tail):
+
+| Run | Throttling mean, t=420–960 | t=1030–1200 | Median p95, t=420–960 | t=1030–1200 | Worst 1-s p95 | Longest run of seconds over 100 ms |
+|---|---|---|---|---|---|---|
+| L5 control (20 min) | 9.8% | 9.4% | 62.8 ms | 62.8 ms | 177 ms | 1 s |
+| 40-min control | 9.3% | 7.7% | 63.0 | 62.6 | 100 ms | 0 |
+| P300 control (bounded, `VIRTUAL_PODS=1`) | 12.6% | 15.2% | 63.1 | 63.0 | 236 ms | 7 s (t=606–612) |
+| F1 (bad labels dropped by the View) | 10.7% | 9.5% | 62.9 | 62.8 | 182 ms (in warm-up) | 0 |
+| F5 (5 bands) | 8.6% | 5.9% | 63.0 | 63.0 | 164 ms | 1 s |
+| L5 hypothesis | 10.9% | 14.6% | 63.0 | 63.3 | **1,340 ms** | **14 s (t=973–986)** |
+| L5 repeat 1 | 11.1% | 18.3% | 63.3 | 63.6 | **497 ms** | **6 s (t=973–978)** |
+| L5 repeat 2 | 14.1% | 17.3% | 63.0 | 63.4 | 169 ms | 1 s |
+| **40-min hypothesis** | 10.8% | 8.9% | 62.8 | 62.9 | **77 ms** | 0 |
+
+**Re-reading the two stalls with this run's data.** Every high-cardinality run, stalled or not, reached the 64 MiB limit at the same point (minute 5–6), so the drop isn't what sets a stall off at t=973. What the two stalls still have in common: the driver's send rate held at 1,898–1,908/s; in-flight requests rose at t=972, one second before p95 did; at the next poll (t=976) **all four replicas, on both nodes, were at 0.99–1.01 cores and 77–100% throttled**; GC pauses stayed at or below 2.4%, with no gen2 collection during the stall; and the exporter's serialize-and-drop pass took 1,057–1,240 ms (first run) and 500–753 ms (repeat 1) instead of 50–140 ms, so the export thread was starved like everything else (a symptom, not the trigger). Something outside the request path raised every replica's CPU demand at once, in two of four hypothesis runs and in no bounded run (the P300 control's 7 s blip peaked at 236 ms, with no sign of all four pods saturating). Node-level metrics from those runs can't be checked now: "Reset everything" restarts Prometheus at the start of each run, so its history only covers the current run. If a stall shows up again, the report needs the node's own CPU and pressure metrics next to the pods'.
+
+**What this changes:**
+
+- The reliable app-side effects of high cardinality are **memory** (about 480 MiB of SDK state per pod) and **loss of the pod's own metrics**, silently, once its export passes 64 MiB. Latency and CPU effects at 80% load are within noise, apart from intermittent stalls that did not repeat in 40 minutes.
+- "The pod goes dark" is a production check in its own right: with OTLP push there is no `up` series for a pod; its series simply go stale. Any pod that was alive while its metrics stopped is a candidate for this mechanism (section 7).
+- A per-pod export budget follows from the limit: 64 MiB ÷ bytes per point. At about 390 B per point (this run: 5 GUID labels) that is about 172k points; at about 175 B (one float label, L1) about 380k. With bounded labels and the SDK's default limit of 2,000 points per instrument, a pod can't get near it, which brings the question back to **which limits production raised** (run A).
+
 ### L1 → L5 trend (hypothesis runs)
 
 | | L1 | L2 | L3 | **L4** | **L5** |
@@ -396,7 +461,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 | Alloy | OOMKilled 4× | OOMKilled 5× | OOMKilled 4× + crash loop | refusing 10.7k pts/s, then OOMKilled 6× (crash-looping at the stall) | refusing about 11k pts/s early, OOMKilled 5–6×, then idle |
 | Peak app heap | 153 MiB | 383 MiB | 476 MiB (83%) | 488 MiB (85%) | 482 MiB (84%) |
 | Peak pod throttling (direct polls) | 52% | 56% | 100% | 95% (cAdvisor 33–64% during the stall) | 100% (all 4 replicas during the stall) |
-| **App p95 / client errors** | flat / 0 | flat / 0 | flat / 0 | **3,000 ms / 2,205 timeouts** (first run); flat / 0 (repeat) | **stalls from t=973 in 2 of 3 runs** (worst 1,340 ms) / 0; median late p95 about 1 ms above control |
+| **App p95 / client errors** | flat / 0 | flat / 0 | flat / 0 | **3,000 ms / 2,205 timeouts** (first run); flat / 0 (repeat) | **stalls from t=973 in 2 of 4 runs** (worst 1,340 ms; none in the 40-min run) / 0; median late p95 0–1 ms above control |
 
 ### L1 → L2: what the GUID labels changed
 
@@ -485,7 +550,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 3. **Retries multiply the agent's inbound load.** The fleet offered about 17k points/s (300 × 569 points per 10 s), but Alloy was refusing 56k–95k points/s, because `in_memory` retries re-offered the same payloads about 5 times over. A refusing agent plus client retries is a feedback loop on the agent, even when it's harmless to the apps.
 4. **Scale check.** The constrained agent (250m CPU / 384 MiB) is a deliberately undersized stand-in. 300 pods × about 570 points is a small fleet by production standards, and this agent couldn't take it. Sizing the agent and the fleet from production figures (series per pod, Alloy limits and replica count) is the next step before this test says anything about production's agent.
 
-**First reading of the new failure-reason counters** (15:17 UTC, fleet still on, Alloy in CrashLoopBackOff after 7 OOMKills): every export from the real replicas and from the fleet failed as **`timeout / cancelled`** after the full 8 s. A Service whose only pod is crash-looping has no ready endpoints, so connections hang instead of being refused. Each export then occupies the background export thread for 8 of every 10 seconds, waiting on the network, not on CPU. The 35 ms failures seen in the L4/L5 runs are a different case, and will be classified the next time a high-cardinality run is made.
+**First reading of the new failure-reason counters** (15:17 UTC, fleet still on, Alloy in CrashLoopBackOff after 7 OOMKills): every export from the real replicas and from the fleet failed as **`timeout / cancelled`** after the full 8 s. A Service whose only pod is crash-looping has no ready endpoints, so connections hang instead of being refused. Each export then occupies the background export thread for 8 of every 10 seconds, waiting on the network, not on CPU. The 35 ms failures seen in the L4/L5 runs are a different case, and will be classified the next time a high-cardinality run is made. **Classified in the 40-min pair: the SDK dropped them inside the pod, before any HTTP request, because the payload was over its 64 MiB request limit.**
 
 **What it leaves open:** why the production app got slow. The candidates still standing are a raised `CardinalityLimit` (run A), and large per-pod SDK state from appended labels or high-resolution histograms. Both are about what each pod holds, which is what the production facts in [next-steps.md](next-steps.md) are meant to establish.
 
@@ -511,13 +576,15 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 7. **Payload size scales with label bytes, not just series count.** After the SDK cap is reached, the series count stops growing, but GUID labels still nearly double each export (≈175 → ≈335 bytes per point).
 
 8. **The SDK cardinality cap bounds the app's memory.** At L3 the heap leveled off at about 470 MiB once each pod reached 200k series. The higher the limit, the higher that ceiling, and above about 576 MiB the app fails (see run A). The limit has two effects: it reserves heap at startup, and it caps the growth later.
-9. **Exports appear capped at about 64 MiB per request.** L2 and L3 peaked at the same 67.06–67.10 MB (64 MiB = 67,108,864 B) despite different label sizes. Larger exports seem to fail before they're sent (either the exporter's buffer limit or Alloy's 64 MiB `max_request_body_size`). The result is silent metric loss, not pressure on the app.
-10. **Agent failure reduces the app's export cost.** With Alloy crash-looping or idle, exports fail instantly, so late-run export time *dropped* (L3: 744 → 17 ms). In OTel .NET, push back from a dead agent turns into data loss, not app CPU. *(Revised:)* in L4/L5 the exports kept failing in about 35 ms for 13+ minutes while Alloy was up and counting nothing. **Why** is unknown. One hypothesis: payloads just over Alloy's 64 MiB `max_request_body_size` (the peak recorded was 67,042,833 B, the limit is 67,108,864 B) were rejected before Alloy counted them. Export failure reasons are now recorded to settle it.
+9. **The SDK drops any export over 64 MiB, whole and silently.** `OtlpExporterOptions.MaxRequestSizeBytes` (OpenTelemetry .NET OTLP exporter 1.18 and later; default 64 MiB = 67,108,864 B): a batch whose serialized payload exceeds it is not sent and is dropped in its entirety, before any HTTP request. L2, L3 and L5 all peaked at 66.5–67.1 MB for that reason, and the failure reasons recorded in the 40-min run confirmed it (844 of 992 failed attempts "not sent"). The result is silent loss of **all** the pod's metrics, not pressure on the app. *(Was: "appear capped… either the exporter's buffer limit or Alloy's `max_request_body_size`".)*
+10. **Agent failure reduces the app's export cost.** With Alloy crash-looping or idle, exports fail instantly, so late-run export time *dropped* (L3: 744 → 17 ms). In OTel .NET, push back from a dead agent turns into data loss, not app CPU. *(Resolved, 40-min pair:)* in L4/L5 the exports kept failing in 35–140 ms for the rest of the run while Alloy was up and counting nothing, because the SDK dropped each one before sending (insight 9). Alloy's 64 MiB `max_request_body_size` was never reached.
 
 11. ~~**The agent's failure mode decides whether the app gets hurt.**~~ **Withdrawn (review 3.4).** It was claimed that an agent that refuses or slows keeps the app retrying, and "that caused the L4 outage". In fact Alloy was crash-looping at the L4 stall (t=183) and idle at the L5 stalls (t=973). The comparison behind it (normal agent L1–L3 against constrained L4–L5) is also confounded by load (60–70% against 70–80%) and node CPUs (3 against 4).
 12. **Synchronized pods fail together.** Replicas started at the same time (a rollout, or this reset) export on aligned timers, so the heavy export and GC cycles hit every pod at once, taking out the whole Service rather than one pod.
 13. **The app-side cost of cardinality lives in the SDK, not in the network path** (review 3.4). Every app-side effect seen (heap about 480 MiB, small throttling increase, stalls) occurred in pods holding about 200k series. It persisted while the agent was crashed or idle, and disappeared with F1. So the questions for production are about **series per pod** and **the cardinality limit**, not only about the agent.
 14. **Pick robust statistics.** A worst-pod throttling average and a mean of per-second p95 both exaggerate short or single-pod events. Reports now also show the mean across pods and the median p95. Judge effects against more than one control.
+15. **A pod over the export limit goes dark, and nothing says so.** The drop takes the whole batch, including the runtime metrics the pod would otherwise use to report its own trouble. With OTLP push there is no `up` series for a pod; its series go stale. The only signal inside the pod is the exporter's EventSource (`RequestDiscardedDueToSizeLimit`). Watch for pods that are alive while their series are stale.
+16. **Measure the noise floor before claiming a small effect.** Three bounded runs at the same rate spread 3 points of mean throttling in one window and 7 in another, and one 40-minute run drifted 4 points between windows. The hypothesis runs' +1–4 points sit inside that. The second control the review asked for turned a "consistent small effect" into "within noise".
 
 ## 7. What to check in production
 
@@ -534,6 +601,7 @@ Possibly relevant to the 2 clusters × 75 pods with degraded response times:
 - [ ] **GC pause time and gen2 collections:** a large heap means longer gen2 pauses, which add directly to request latency. *Not yet measured in these reports; worth adding.*
 - [ ] **Pod restarts with exit `Error` after liveness-probe failures**, not `OOMKilled`.
 - [ ] **Agent (Alloy or Collector) restarts and OOMKills, and OTLP request sizes.**
+- [ ] **OTLP exporter version and request limit:** `OpenTelemetry.Exporter.OpenTelemetryProtocol` 1.18 and later drop any export over 64 MiB (`OtlpExporterOptions.MaxRequestSizeBytes`) before sending, silently. **Did any pod's series go stale while the pod was running?** That is the signature (insight 15), and it would have hidden the pod's heap and GC metrics during the incident.
 - [ ] **CPU throttling** (`container_cpu_cfs_throttled_periods_total`) if pods run close to their CPU limits.
 
 ## 8. Next steps
@@ -543,8 +611,8 @@ Pick-up notes, cluster state and the open decisions are in [next-steps.md](next-
 1. ~~Finish the P300 pair~~ **Done: no effect on the app; agent overwhelmed; monitoring dark.** (section 4b)
 2. **Get the production facts:** the cardinality limit settings, series per pod, the bucketing form, the appended labels and where they're added, and Alloy's limits and replicas. Then size the fleet and agent from them.
 3. **Re-test run A with production's real cardinality limit settings.** It needs no bad label and doesn't show as `OOMKilled`.
-4. **Deploy the export-failure-reason recording** and find out why exports fail in about 35 ms while Alloy counts nothing.
-5. **One longer L5 hypothesis (40 min or more) and a second L5 control**, to see whether the t=973 event recurs on a period, and to measure run-to-run noise.
+4. ~~Deploy the export-failure-reason recording~~ **Done: the ~35 ms failures are the SDK dropping exports over its 64 MiB request limit before sending** (section 4, "L5 × 40 min").
+5. ~~One longer L5 hypothesis and a second L5 control~~ **Done: no stall in 40 minutes; the steady-state CPU effect is within the noise floor of three bounded runs; median p95 at most 1 ms higher.**
 6. **L5 with the normal agent**, to separate agent profile from load level.
 7. **Appended identity labels** (`make appended-labels N=4`) with the fleet, once production's list is known.
 
@@ -561,6 +629,9 @@ Done earlier: soak verdict with a control (now CONFIRMED needs a clean control),
 | 2026-11-15 | Alloy restarts in the L5 repeats are 6 and 5, not 1 and 0 (`alloyRestartsDelta` undercounts). | review 5.5 |
 | 2026-11-15 | Histogram cost is 8,960 series (14 per combination), not 7,680. | review 5.6 |
 | 2026-11-15 | Production already buckets response time. The float label isn't the production cause. | user, review 5.7 |
+| 2026-11-15 | "Exports fail in about 35 ms while Alloy counts nothing; why is unknown" (insight 10): the SDK drops any export over its 64 MiB request limit before sending. Alloy's `max_request_body_size` was never reached. | 40-min pair, failure reasons |
+| 2026-11-15 | "L5: 2 of 3 runs stalled" is now 2 of 4. The 40-minute hypothesis run and a second control were clean, and the steady-state CPU effect is within the spread of three bounded runs. | 40-min pair |
+| 2026-11-15 | The report's "App heap (peak)" comes from Prometheus and under-reads once the pod's exports are dropped (56 MiB shown against 480 MiB by direct polls in the 40-min hypothesis run). Quote the direct polls. | 40-min pair |
 
 ## 9. Reports
 
@@ -568,6 +639,8 @@ All reports are in `./reports/` (gitignored). Refresh them with `make reports`, 
 
 | Run | Report file |
 |---|---|
+| **L5 40-min hypothesis** | `reports/20261115-164321-l5-40m-hypothesis-1900-req-s-40m-constra.html` |
+| L5 40-min control | `reports/20261115-160209-l5-40m-control-1900-req-s-40m-constraine.html` |
 | **P300 fleet** (300 simulated pods) | `reports/20261115-144847-p300-fleet-300-simulated-pods-1900-req-s.html` |
 | P300 control (no fleet) | `reports/20261115-142737-p300-control-no-fleet-1900-req-s-20m-con.html` |
 | **L5 F5 latency band** | `reports/20261115-134526-l5-f5-latency-band-hypothesis-1900-req-s.html` |

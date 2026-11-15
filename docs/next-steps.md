@@ -1,6 +1,6 @@
 # Next steps: picking up the experiment
 
-**Updated:** 2026-11-15, after the L5 runs, fix runs F1 and F5, [the independent review](review-2026-11-15.md), and the start of the 300-pod fleet test. Results and evidence are in [experiment-log.md](experiment-log.md). The fix plan is in [proving-the-fix.md](proving-the-fix.md).
+**Updated:** 2026-11-15 (evening), after the L5 runs, fix runs F1 and F5, [the independent review](review-2026-11-15.md), the 300-pod fleet test and the 40-minute L5 pair. Results and evidence are in [experiment-log.md](experiment-log.md). The fix plan is in [proving-the-fix.md](proving-the-fix.md).
 
 ## Where we are
 
@@ -10,14 +10,18 @@
   3. **The aggregate of all pods overwhelming the agent.** Likely to cost lost metrics rather than slower requests (see below).
 - **What the repro has shown (after the review's corrections):**
   - **Pipeline damage from cardinality: every time.** 200k series per pod, 35–67 MB exports, Alloy OOMKilled 4–6× per run.
-  - **Cost to the app:** clear in **heap** (about 480 MiB against 40 MiB), small in **CPU** (+1–4 points of mean throttling across pods, about 1 ms of median p95), and **intermittent stalls**: L4 1 of 2, L5 2 of 3, both L5 stalls starting at t=973 for unknown reasons.
-  - **Mechanism:** the app's cost comes from the **SDK's own state**, not agent back pressure. The agent was crash-looping or idle during every stall.
+  - **Cost to the app:** clear in **heap** (about 480 MiB against 40 MiB); **CPU within noise** (+1–4 points of mean throttling, inside the 3–7 point spread of three bounded runs); **median p95 at most 1 ms higher**; and **intermittent stalls**: L4 1 of 2, L5 2 of 4, both L5 stalls starting at t=973 for unknown reasons, none in the 40-minute run.
+  - **Mechanism:** the app's cost comes from the **SDK's own state**, not agent back pressure. The agent was crash-looping or idle during every stall. From minute 6 of every high-cardinality run the SDK **dropped each export before sending** (payload over the OTLP exporter's 64 MiB `MaxRequestSizeBytes`), which also took the pod's own runtime metrics out of Prometheus.
   - **Fixes:** F1 (SDK allow-list View) removes everything. F5 (latency bands) is safe.
 - **300-pod fleet test: done. Agent overload alone does not slow the app.** 300 simulated pods (own pod name, bucketed response time) shared the constrained agent with the 4 real replicas.
   - **Agent:** refused up to 97k points/s, OOMKilled 6×. 98% of fleet exports failed. The real replicas' metrics were dark for about 18 of 20 minutes.
   - **App:** 0 failures, heap 35 MiB, throttling and p95 at control level, even though its own exports failed and retried the whole run (1,204 retries at the 8 s timeout).
   - **Conclusion:** the cost of cardinality to the app is the size of the SDK's own state. Agent overload costs visibility, not latency. Retries multiplied the agent's inbound load about 5×.
   - The prediction written down before the run held.
+- **40-minute L5 pair: done. No stall, and the export failures are explained.** A 40-minute control and a 40-minute hypothesis run (200k series, 480 MiB heap per pod), scored against criteria written before the runs:
+  - **t=973 did not recur.** Neither run had a second above 100 ms after warm-up. Stalls stand at 2 of 4 hypothesis runs (peaks 1,340 and 497 ms); no bounded run went above 236 ms. Trigger still unknown, not periodic.
+  - **Noise floor:** three bounded runs spread 3 points of mean throttling (t=420–960) and 7 points (t=1030–1200). The hypothesis runs sit inside it. Median p95: at most 1 ms apart.
+  - **Why exports fail:** 844 of 992 failed attempts were "not sent". The OTel .NET OTLP exporter drops any export over **64 MiB** (`OtlpExporterOptions.MaxRequestSizeBytes`, exporter 1.18+) before any HTTP request. Each replica crossed it in minute 6 and then dropped every export, runtime metrics included: **dark in Prometheus for 34 minutes** while Alloy sat idle at 85 MiB.
 
 ## Scorecard
 
@@ -32,8 +36,10 @@
 | **L5 F5 band** | 80% | `response_time` as 5 bands: **healthy** | (same control) |
 | P300 control (no fleet) | 80% | clean (worst p95 236 ms, 0 errors) | — |
 | **P300 fleet** (300 pods) | 80% | **no app effect** (0 errors, heap 35 MiB, p95 at control); agent refused up to 97k pts/s, OOMKilled 6×; 98% of fleet exports lost | clean |
+| L5 40-min control | 80% | clean (worst p95 100 ms, 0 errors) | — |
+| **L5 40-min hypothesis** | 80% | **no stall in 40 min** (worst p95 77 ms, 0 errors); heap 480 MiB; every export dropped by the SDK from minute 6 (payload > 64 MiB); replicas dark in Prometheus for 34 min; Alloy OOMKilled 5× then idle | clean |
 
-Mean throttling across pods, t=420–960: control 9.8%, hypothesis runs 10.9 / 11.2 / 14.1%, F1 10.7%, F5 8.6%. Median late p95: 62.6 ms against 63.6–63.7 ms. There is only one control, so a few points is within noise.
+Mean throttling across pods, t=420–960: bounded runs 9.8 / 9.3 / 12.6% (L5 control, 40-min control, P300 control), hypothesis runs 10.9 / 11.1 / 14.1 / 10.8%, F1 10.7%, F5 8.6%. Median p95, t=1030–1200: bounded 62.8 / 62.6 / 63.0 ms, hypothesis 63.3 / 63.6 / 63.4 / 62.9 ms. With three bounded runs the noise floor is about 3 points of throttling and 0.5 ms of p95, so the hypothesis runs' CPU difference is within noise and the p95 difference is at most about 1 ms.
 
 ## State things were left in
 
@@ -46,9 +52,10 @@ Mean throttling across pods, t=420–960: control 9.8%, hypothesis runs 10.9 / 1
 | Histogram buckets | Reshaped around real latencies (`10, 25, 40, 50, 60, 70, 80, 100, 250 ms, 1, 3 s`) from the fleet build on |
 | Node CPUs | App nodes at **4 CPUs** (`APP_NODE_CPUS=4 make node-cpus`), not the Makefile default of 3 |
 | Run history | On the driver's PVC. HTML copies are in `./reports/` (`make reports`, gitignored) |
-| Git | PR #9 merged. P300 results are the next docs PR |
+| Git | PR #9 merged. PR #10 (this branch): the P300 results and the 40-minute pair |
 | Deployed build | `main` after PR #9: export-failure-reason recording, appended-labels knob, robust report statistics, churn fix (deployed 2026-11-15 15:16 UTC and verified: `/admin/stats` now has `exportFailureReasons` and `appendedLabels`). The first `make app` attempt failed silently in `k3d image import`; running it again worked |
-| Alloy | Restarted clean after the fleet was switched off |
+| Alloy | `restartCount` 5 since the 40-min hypothesis run (OOMKilled during its first 4 minutes, idle since). "Reset everything" restarts it before the next run |
+| Real replicas' SDK state | Still holding the 40-min hypothesis run's 200k series and 480 MiB heap each, and dropping every export (payload > 64 MiB). "Reset everything" (part of every prepared run) restarts them |
 
 ## Resume
 
@@ -74,6 +81,8 @@ Ask the observability team, or check the code and config:
 - [ ] **Alloy:** replicas, CPU and memory limits, and `memory_limiter` settings. Are there OOMKills or refused points (`otelcol_receiver_refused_metric_points_total`)?
 - [ ] **OTel retry:** is `OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY` set? What's the export interval?
 - [ ] **Heap against the GC limit** on app pods (75% of the memory limit), and restarts with exit `Error` (not `OOMKilled`).
+- [ ] **OTLP exporter package version and request limit:** `OpenTelemetry.Exporter.OpenTelemetryProtocol` 1.18 and later drop any export over 64 MiB (`OtlpExporterOptions.MaxRequestSizeBytes`) before sending. Which version is deployed, and is the limit set?
+- [ ] **Pods whose series went stale while the pod kept running** during the incident. That is the signature of the drop (experiment log, insight 15): the pod's own heap and GC metrics vanish with the rest.
 
 ### 2. Which experiment next?
 
@@ -83,18 +92,20 @@ Ask the observability team, or check the code and config:
 2. **Re-test run A with production's cardinality-limit settings.** This is the strongest remaining production candidate, and it needs no bad label.
 3. ~~Deploy PR #9's recording~~ **Done.** The next runs say *why* exports fail.
 4. **Size the fleet and agent from production figures** (series per pod, Alloy limits), and add the appended labels production uses (`make appended-labels N=…`).
-5. **One 40-minute L5 hypothesis plus a second L5 control,** to see whether the t=973 event recurs on a period, and to measure noise.
-6. **L5 with the normal agent,** to separate agent profile from load level.
+5. ~~One 40-minute L5 hypothesis plus a second L5 control~~ **Done:** no stall, noise floor measured, export failures explained (experiment log, section 4, "L5 × 40 min").
+6. **L5 with the normal agent,** to separate agent profile from load level. Lower priority: the stall question is parked until a stall recurs, and when one does, the report needs node-level CPU and pressure metrics, which it doesn't record yet.
 
 ### 3. What counts as an effect?
 
 **Bar, set before the runs:**
 
 - **Stalls:** an outage or stall in at least 2 of 3 runs, with every matching control clean.
+- **Measured noise floor (2026-11-15):** three bounded runs at 1,900 req/s spread 3 points of mean throttling at t=420–960 and 7 points at t=1030–1200; their median p95 spans 0.5 ms. Anything smaller is noise.
 - **Steady-state effects:** judge these on the **mean across pods** and the **median p95**, against at least two controls. The report's worst-pod throttling and mean p95 exaggerate single-pod and short events.
 
 ### 4. Housekeeping
 
-- Review and approve PR #9.
-- Delete merged remote branches (`feature/stall-verdict-gc`).
+- Merge PR #10.
+- Delete the merged branches, local and remote: `feature/fleet-sim`, `feature/latency-band`, `feature/stall-verdict-gc`, `features/docsupdate`.
+- Report tooling: take "App heap (peak)" from the direct polls, not Prometheus (it showed 56 MiB against 480 MiB once the pod's exports were being dropped). Add node-level CPU and pressure metrics to the report, for the next stall.
 - When the experiment is over, use `make down` to delete the cluster. `k3d cluster stop cardinality` only stops it.

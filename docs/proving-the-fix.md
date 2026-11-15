@@ -92,6 +92,7 @@ These turn one bad label into a dashboard problem instead of an outage.
 - **SDK:**
   - Keep `CardinalityLimit` low. The default of 2,000 is a protection: overflow goes to `otel_metric_overflow` instead of exploding. Production has almost certainly raised it; check.
   - Use the allow-list View from section 1.
+  - Know the OTLP exporter's request limit: `OtlpExporterOptions.MaxRequestSizeBytes` is 64 MiB from exporter 1.18 on, and a larger export is dropped whole, silently, runtime metrics included. Keep each pod's export far below it, and alert on pods whose series go stale while the pod is alive.
 - **Agent:**
   - Use a `memory_limiter`.
   - Drop known-bad series before remote write, as [config-protect.alloy](../agent/config-protect.alloy) does. This is a safety net only: the agent can drop whole series, but only the SDK can merge them correctly once a label is removed.
@@ -126,18 +127,19 @@ Each run is the hypothesis preset at that level, plus a fix knob. All knobs alre
 
 Compare against the hypothesis run at the same level and against its control. The fix passes when all of these hold:
 
-| Signal | Hypothesis (L5, 3 runs) | Fixed means | **F1 result** |
+| Signal | Hypothesis (L5, 4 runs) | Fixed means | **F1 result** |
 |---|---|---|---|
 | Export payload per replica | 66–67 MB, 200k points | at control level, ≈1.2 MB / 8k points | ✅ 1.2 MB / 8.2k |
-| Export failures / retries | 452–455 / 45–68 | 0 / 0 | ✅ 0 / 0 |
+| Export payload against the exporter's 64 MiB request limit (`MaxRequestSizeBytes`) | over it from minute 6: every export dropped inside the pod, pod dark in Prometheus | well under it | ✅ 1.2 MB |
+| Export failures / retries | 452–935 / 45–68 (from minute 6, every export dropped by the SDK as larger than 64 MiB) | 0 / 0 | ✅ 0 / 0 |
 | Alloy | refusing 10.6–11.2k points/s early, OOMKilled 5–6× (Kubernetes `restartCount`), then idle | no restarts, 0 refused | ✅ healthy |
 | App .NET heap (peak) | 477–482 MiB of 576 MiB | at control level, ≈40 MiB | ✅ 41 MiB |
 | Pod throttling, **mean across pods**, t=1030–1200 | 14.7–18.4% | within a few points of control (9.4%) | ✅ 9.6% |
 | Pod throttling, worst pod, late quarter (report statistic) | 42–51% | within a few points of control (33%) | ✅ 31% |
 | p95, late quarter, **median** of per-second p95 | 63.6–63.7 ms | within about 1 ms of control (62.6 ms) | ✅ 62.8 ms |
-| Stalls / client errors | 2 stalls from t=973 (worst p95 1,340 ms), 0 errors | none | ✅ none |
+| Stalls / client errors | 2 of 4 runs stalled from t=973 (worst p95 1,340 ms; none in the 40-minute run), 0 errors | none | ✅ none |
 
-The steady-state CPU and latency differences being fixed are small (review 3.1–3.2). The clear signals F1 removes are the **SDK state** (heap, export size and failures), the **agent damage**, and the **stalls**.
+The steady-state CPU and latency differences being fixed are small, within the noise floor measured against a second and third bounded run (review 3.1–3.2, 40-min pair). The clear signals F1 removes are the **SDK state** (heap, export size and failures), the **agent damage**, and the **stalls**.
 
 **F5 passed** (run `20261115-134526`):
 
@@ -164,6 +166,7 @@ For F3, record each step's numbers. The first precision at which every signal is
 Once the fix is chosen, verify it in production with the same signals:
 
 - the OTLP export size and failures per pod
+- no pod whose series go stale while it keeps running (the signature of a dropped export)
 - agent memory, restarts and refused points
 - `prometheus_tsdb_head_series`
 - app p95 and CPU throttling

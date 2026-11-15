@@ -10,7 +10,7 @@ A local reproduction of a production incident. A .NET service records each HTTP 
  k6 ──remote_write (its own latency, bypasses Alloy)──────────────────────────────────────────────────▶ Prometheus
 ```
 
-> **Status (2026-11-15):** results are in [docs/experiment-log.md](docs/experiment-log.md), with pick-up notes in [docs/next-steps.md](docs/next-steps.md) and the fix plan in [docs/proving-the-fix.md](docs/proving-the-fix.md). The production service turned out to **already bucket response time**. So the float label here is a reproduction device, not the production cause, and the suspects are now the `pod` and appended labels and the SDK cardinality limit. See the [300-pod fleet](#pod-label-test-a-300-pod-simulated-fleet) below. An [independent review](docs/review-2026-11-15.md) corrected several claims: in this repo, the app's cost comes from the SDK's own state, not from agent back pressure.
+> **Status (2026-11-15):** results are in [docs/experiment-log.md](docs/experiment-log.md), with pick-up notes in [docs/next-steps.md](docs/next-steps.md) and the fix plan in [docs/proving-the-fix.md](docs/proving-the-fix.md). The production service turned out to **already bucket response time**. So the float label here is a reproduction device, not the production cause, and the suspects are now the `pod` and appended labels and the SDK cardinality limit. See the [300-pod fleet](#pod-label-test-a-300-pod-simulated-fleet) below. An [independent review](docs/review-2026-11-15.md) corrected several claims: in this repo, the app's cost comes from the SDK's own state, not from agent back pressure. A 40-minute L5 pair (three bounded runs to compare against now) found **no stall**, put the labels' steady-state CPU effect **within noise**, and explained the export failures: the OTel SDK **drops any export over 64 MiB before sending**, which silently takes the pod's own metrics out of Prometheus.
 
 All components are free and open source: k3d/k3s, kube-prometheus-stack 93.3.0, Grafana Alloy v1.21.3 (chart 1.15.0), OpenTelemetry .NET 1.21, k6 1.8.3.
 
@@ -96,7 +96,7 @@ Give each run a **name**, and optionally **notes**, in the console before you cl
   - Alloy OTLP in and remote_write failures
 - Container terminations, Kubernetes warning events, and **exception lines and the fatal stack from crashed containers' logs**
 
-Open or download a report from **Run history** in the console, or run `make reports` to copy all of them to `./reports/` (gitignored). Runs and reports are stored on a persistent volume, so they survive driver restarts. The driver gets read-only access to pods, pod logs and events through its own ServiceAccount.
+Open or download a report from **Run history** in the console, or run `make reports` to copy all of them to `./reports/` (gitignored). Runs and reports are stored on a persistent volume, so they survive driver restarts. `python3 tools/report-stats.py reports/<run>.html` prints the statistics the experiment log quotes from a report's embedded data (windowed mean throttling, median p95, stalls, export failure reasons; `--minutes` adds the per-minute export timeline). The driver gets read-only access to pods, pod logs and events through its own ServiceAccount.
 
 ### Where the starvation comes from
 
