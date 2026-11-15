@@ -89,7 +89,11 @@ Ask the observability team, or check the code and config:
 **Recommended order:**
 
 1. ~~Finish the P300 pair~~ **Done** (experiment log, section 4b): no app effect.
-2. **Re-test run A with production's cardinality-limit settings.** This is the strongest remaining production candidate, and it needs no bad label.
+2. **Run-A sweep: the cardinality limit by itself.** The strongest remaining production candidate, it needs no bad label, and this version needs no production facts (about 1 hour of cluster time). Run A showed that a limit of 200k on every instrument reserves about 560 MiB at startup. The sweep maps the whole curve so production's value can be read off it once known.
+   - **Settings:** bounded labels, constrained + protect agent, 4 replicas, `VIRTUAL_PODS=50`. `OTEL_CARDINALITY_LIMIT_SCOPE=all` with `OTEL_CARDINALITY_LIMIT` at **2,000 (the SDK default), 10,000, 50,000, 100,000 and 200,000**: `kubectl --context k3d-cardinality -n demo set env deploy/transactions-api OTEL_CARDINALITY_LIMIT=<n> OTEL_CARDINALITY_LIMIT_SCOPE=all`, then a prepared run (which restarts the pods). Restore with `OTEL_CARDINALITY_LIMIT=200000 OTEL_CARDINALITY_LIMIT_SCOPE=transactions` afterwards.
+   - **Measure:** the idle heap after startup (direct polls, `/admin/stats`) against the 576 MiB GC limit; then a 10-minute soak at 1,900 req/s per value, with the usual report. The controls are the existing bounded runs (scope `transactions`, idle heap 26 MiB).
+   - **Criteria, to be written into the log before the first run:** a value *fails* if its soak has client errors, a stall (5 s or more over 100 ms) or pod restarts with exit `Error`; otherwise it *costs* the idle heap it reserves. Expected: heap grows linearly with the limit (run A: 560 MiB ÷ 200k ≈ 2.9 KB per unit of limit across the ~30 instruments), and the app fails somewhere between 100k and 200k.
+   - **Output:** a table *limit → idle heap, soak result*. Once production's value is known, it is read off the table, and the exact re-test with production's settings follows.
 3. ~~Deploy PR #9's recording~~ **Done.** The next runs say *why* exports fail.
 4. **Size the fleet and agent from production figures** (series per pod, Alloy limits), and add the appended labels production uses (`make appended-labels N=…`).
 5. ~~One 40-minute L5 hypothesis plus a second L5 control~~ **Done:** no stall, noise floor measured, export failures explained (experiment log, section 4, "L5 × 40 min").
