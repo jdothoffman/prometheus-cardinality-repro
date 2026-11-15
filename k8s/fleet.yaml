@@ -36,6 +36,8 @@ spec:
             # Stand-in for the other metrics (runtime, HTTP server/client, dependency calls) each pod exports.
             - { name: FLEET_EXTRA_SERIES, value: "100" }
             - { name: FLEET_CHURN_SECONDS, value: "0" }
+            # 0-8 identity labels on every series (k8s node, pod uid, container id, ...). make appended-labels N=...
+            - { name: FLEET_APPENDED_LABELS, value: "0" }
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://alloy.alloy.svc.cluster.local:4318" }
             - { name: OTEL_METRIC_EXPORT_INTERVAL, value: "10000" }
             - { name: OTEL_METRIC_EXPORT_TIMEOUT, value: "8000" }

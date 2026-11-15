@@ -2,7 +2,10 @@
 // Grafana Alloy agent, CONSTRAINED profile (`make agent-constrained`): same pipeline as config.alloy,
 // but Alloy runs with a small CPU/memory budget (agent/values-constrained.yaml) and a memory_limiter.
 // Under load it processes slowly and refuses data when memory is tight (HTTP 503 to the app's exporter),
-// so the app retries and holds payloads longer: back pressure from the metrics pipeline onto the app.
+// so the app retries and holds payloads longer. That was the intended back-pressure mechanism. In the
+// L4/L5 runs, though, this agent was crash-looping or receiving nothing when the app stalled (see
+// docs/review-2026-11-15.md, 3.4): the app-side cost came from the SDK's own high-cardinality state,
+// not from refusals. Treat this profile as "an undersized agent", not as proof of back pressure.
 // Unlike config-guarded.alloy it drops nothing: the point is to apply pressure, not to filter.
 
 logging {

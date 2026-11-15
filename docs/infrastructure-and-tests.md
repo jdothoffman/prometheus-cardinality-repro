@@ -10,7 +10,9 @@ k6 or transactions-driver  ──HTTP──▶  transactions-api ×4   ──OTL
 k6 ──remote_write (own latency)──────────────────────────────────────────────────────────────────────────────────────────▶ Prometheus
 ```
 
-Optional: `transactions-fleet` on a separate node pool pushes additional OTLP load into Alloy (`make fleet-on`).
+Optional: `transactions-fleet` on a separate node pool pushes additional OTLP load into Alloy (`make fleet-on`). It simulates 300 pods, each with its own SDK pipeline and export, so Alloy sees a production-sized fleet.
+
+Results and their interpretation: [experiment-log.md](experiment-log.md). Pick-up notes: [next-steps.md](next-steps.md).
 
 ## Versions
 
@@ -31,12 +33,12 @@ Cluster name: `cardinality` (kubectl context `k3d-cardinality`).
 
 | Node | Pool label | Memory / CPUs | What runs there |
 |---|---|---|---|
-| `k3d-cardinality-server-0` | control plane | 1536m RAM | k3s; `transactions-driver`; some monitoring |
-| `k3d-cardinality-agent-0/1` | `pool=app` | 2304m RAM each, **3 CPUs** each (`make node-cpus`) | `transactions-api`, k6; Prometheus/Grafana (default profile) |
+| `k3d-cardinality-server-0` | control plane | 1536m RAM (about 94% used) | k3s; `transactions-driver`; **Prometheus** (as scheduled 2026-11-15) |
+| `k3d-cardinality-agent-0/1` | `pool=app` | 2304m RAM each, **3 CPUs** each by default; **4 CPUs since L5** (`APP_NODE_CPUS=4 make node-cpus`) | `transactions-api`, k6; also Grafana, kube-state-metrics, Alertmanager, the Prometheus operator, CoreDNS and metrics-server (unpinned, so they share CPU with the app: a source of background noise) |
 | `k3d-agentpool-0` | `pool=agent`, taint `pool=agent:NoSchedule` | 1280m RAM, **2 CPUs** | **Grafana Alloy only** |
-| `k3d-fleetpool-0` (optional) | `pool=fleet`, taint `pool=fleet:NoSchedule` | 1792m RAM, **2 CPUs** | `transactions-fleet` |
+| `k3d-fleetpool-0` (optional) | `pool=fleet`, taint `pool=fleet:NoSchedule` (applied with `kubectl taint` by `make fleet-node`: passing `--node-taint` to `k3d node create` duplicated it and crash-looped the kubelet) | 1792m RAM, **2 CPUs** | `transactions-fleet` |
 
-Total memory from the base three agent-ish nodes is ~7.25GB inside Docker Desktop’s VM. Prefer ≥12GB for the VM.
+These nodes add up to about 9 GB of memory limits on a Docker Desktop VM of 8 GB. That works because limits aren't all used at once, but there's little headroom. A VM of 12 GB or more is more comfortable.
 
 Bring-up:
 
@@ -82,6 +84,10 @@ Default app env (from `k8s/app.yaml`):
 | `OTEL_METRIC_EXPORT_INTERVAL` | `10000` | Push every 10s (background) |
 | `OTEL_METRIC_EXPORT_TIMEOUT` | `8000` | Per-export timeout |
 | `OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY` | `in_memory` | Retries hold payloads in app memory |
+| `OTEL_ALLOWED_TAGS` | unset | Fix F1 (`make fix-app`): an SDK View keeps only these tag keys |
+| `APPENDED_LABELS` | `0` | 0–8 identity labels (k8s node, pod uid, container id, …) on every series (`make appended-labels N=…`) |
+
+Fleet env (`k8s/fleet.yaml`): `FLEET_PODS=150` per replica, `FLEET_RATE_PER_POD=6`, `FLEET_RESPONSE_TIME=band` (`off` or 0–6 decimals), `FLEET_EXTRA_SERIES=100`, `FLEET_CHURN_SECONDS=0`, `FLEET_APPENDED_LABELS=0`. `make fleet-on` re-applies the manifest, so run `make appended-labels` after it.
 
 ### `alloy` — metrics agent
 
@@ -98,9 +104,9 @@ Agent profiles (`make`):
 | Target | Resources | Config | Effect |
 |---|---|---|---|
 | `make agent` / `agent-normal` | requests 200m/256Mi, limit **1Gi** (no CPU limit) | `config.alloy` or `config-protect.alloy` | Keeps up under moderate load |
-| `make agent-constrained` | limit **250m CPU / 384Mi** | `config-constrained*.alloy` + `values-constrained.yaml` | `memory_limiter` → HTTP 503 → app retries / back pressure |
+| `make agent-constrained` | limit **250m CPU / 384Mi** | `config-constrained*.alloy` + `values-constrained.yaml` | `memory_limiter` refuses (HTTP 503) early in a run, then Alloy OOMs and crash-loops or sits idle. It was intended to cause app retries and back pressure, but during the L4/L5 stalls it was crashed or idle ([review](review-2026-11-15.md) 3.4) |
 | `make guard-agent` | same as normal | `config-guarded.alloy` | memory_limiter + drop series with `response_time` |
-| `PROTECT_PROM=1` | — | `*-protect.alloy` | Drops high-cardinality series (`response_time` / GUID labels) before Prometheus so Grafana stays usable |
+| `PROTECT_PROM=1` | — | `*-protect.alloy` | Drops high-cardinality series (`response_time` / GUID labels) **and the simulated fleet's series** (`otel_scope_name` `Transactions.Api.sim.*`) before Prometheus so Grafana stays usable |
 
 ### `monitoring` — Prometheus + Grafana
 
@@ -132,13 +138,13 @@ Dashboards:
 | `consume_type` | 4 | api, web, mobile, batch |
 | `state` | 4 | completed, pending, declined, failed |
 | `product` | 10 | checking, savings, … |
-| `pod` | ~200 | 4 replicas × `VIRTUAL_PODS=50` |
-| `response_time` | unbounded | float string, e.g. 6 decimals — **the bug** |
+| `pod` | ~200 | 4 replicas × `VIRTUAL_PODS=50`. With `make prod-pods` (`VIRTUAL_PODS=1`): each replica's own name, as in production |
+| `response_time` | unbounded | float string, e.g. 6 decimals: **the repro's bug**. Production already buckets response time. `band` = 5 fixed values (`0-50ms` … `3s+`) |
 | optional GUID labels | 0–5 | `request_id`, `trace_id`, `session_id`, `correlation_id`, `tenant_id` |
 
 Bounded baseline: **4 × 4 × 10 × 200 = 32,000** series.
 
-Also recorded for comparison: `http_transaction_duration_seconds` (histogram; no `pod` / `response_time` on the bad path).
+Also recorded for comparison: `http_transaction_duration_seconds` (histogram, labels `consume_type, state, product`; pod via `instance`). Buckets are shaped around this app's latencies: `10, 25, 40, 50, 60, 70, 80, 100, 250 ms, 1, 3 s`. The earlier `5, 10, 25, 50, 100 ms, …` overstated p95 (89 against 63 ms). That's 11 boundaries = 14 series per label combination.
 
 Exports use **cumulative** temporality: every interval re-sends all series the SDK still holds.
 
@@ -214,17 +220,39 @@ While exploded (reset Prometheus if looping):
 
 Undo: `make unfix-app` / `uncap-app` / `unguard-agent`.
 
-### 7. Optional fleet load
+### 7. Fix runs (F1, F5)
+
+Each is a hypothesis preset with a fix applied. They're compared against the same control.
+
+- **F1:** `make fix-app`, then Run hypothesis. The SDK View drops the bad labels. Undo with `make unfix-app`.
+- **F5:** Run hypothesis with `response_time` precision set to **band** and 0 GUID labels.
+
+See [proving-the-fix.md](proving-the-fix.md).
+
+### 8. Pod-label test with the 300-pod fleet (P300)
 
 ```sh
 make fleet-node   # once per cluster
-make fleet-on     # FLEET_REPLICAS×150 simulated pods → Alloy
-make fleet-off
+make prod-pods    # real replicas: own pod name (make lab-pods restores 50)
+make fleet-off    # control: same labels (response_time band, 0 GUIDs), no fleet
+make fleet-on     # fleet run: FLEET_REPLICAS (2) × 150 = 300 simulated pods → Alloy
+make appended-labels N=4   # optional: identity labels on every series (real replicas + fleet)
 ```
+
+A fleet run's report finds its control automatically: the same labels, with no fleet. The pass/fail criteria for the first P300 pair are in the experiment log, section 4b.
 
 ### Reports
 
-After each console run, the driver waits ~25s, collects evidence (terminations, events, crash logs, PromQL charts), and writes a self-contained HTML report. Copy locally with:
+After each console run, the driver waits ~25s, collects evidence (terminations, events, crash logs, PromQL charts), and writes a self-contained HTML report.
+
+A report also includes:
+- **Why exports failed**, per failed HTTP attempt: `HTTP <code>`, `timeout / cancelled`, `connection: …`, or "not sent".
+- **Throttling** as the most-throttled pod *and* the mean across pods.
+- **p95** as a mean *and* a median.
+- **Alloy restarts** from the Kubernetes `restartCount`.
+- **The simulated fleet's size** and its export failures.
+
+Copy reports locally with:
 
 ```sh
 make reports   # → ./reports/ (gitignored)

@@ -19,6 +19,8 @@
 //   FLEET_EXTRA_SERIES      extra gauge series per pod, standing in for the runtime/HTTP/dependency
 //                           metrics a real pod also exports                    (default 100)
 //   FLEET_CHURN_SECONDS     if >0, replace ~20% of the simulated pods this often (rollouts)  (default 0)
+//   FLEET_APPENDED_LABELS   0-8 identity labels per series (k8s node, pod uid, container id, ...), as an
+//                           observability team might append them; same as APPENDED_LABELS on the api (default 0)
 //   OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_METRIC_EXPORT_INTERVAL / OTEL_METRIC_EXPORT_TIMEOUT, and
 //   OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY as for the api role.
 
@@ -47,7 +49,8 @@ static class Fleet
 }
 
 sealed record FleetStats(int Pods, double RatePerPod, string ResponseTime, int ExtraSeries, int ChurnSeconds,
-    long Exports, long ExportFailures, long HttpRetries, double MaxLastExportMs, long PointsPerPod, long Churned);
+    long Exports, long ExportFailures, long HttpRetries, double MaxLastExportMs, long PointsPerPod, long Churned,
+    int AppendedLabels = 0, Dictionary<string, long>? FailureReasons = null);
 
 sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : BackgroundService
 {
@@ -56,6 +59,8 @@ sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : B
     private readonly int _rt = ParseResponseTime(cfg["FLEET_RESPONSE_TIME"]);
     private readonly int _extra = Math.Clamp(cfg.GetValue("FLEET_EXTRA_SERIES", 100), 0, 10_000);
     private readonly int _churnSeconds = Math.Max(0, cfg.GetValue("FLEET_CHURN_SECONDS", 0));
+    private readonly int _appended = Math.Clamp(cfg.GetValue("FLEET_APPENDED_LABELS", 0), 0, AppendedLabels.Names.Length);
+    private int _churning; // 1 while a churn is retiring pods, so timer ticks never overlap
     private readonly string _endpoint = (cfg["OTEL_EXPORTER_OTLP_ENDPOINT"] ?? "http://localhost:4318").TrimEnd('/');
     private readonly int _intervalMs = cfg.GetValue("OTEL_METRIC_EXPORT_INTERVAL", 10_000);
     private readonly int _timeoutMs = cfg.GetValue("OTEL_METRIC_EXPORT_TIMEOUT", 8_000);
@@ -64,6 +69,7 @@ sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : B
     private readonly Lock _lock = new();
     private readonly List<SimPod> _pods = [];
     private long _churned, _retiredExports, _retiredFailures, _retiredRetries;
+    private readonly Dictionary<string, long> _retiredReasons = [];
 
     // -2 = no response_time label, -1 = band (LabelSet.Band), 0..6 = decimals.
     private static int ParseResponseTime(string? v) => (v ?? "band").Trim().ToLowerInvariant() switch
@@ -84,10 +90,12 @@ sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : B
     {
         SimPod[] pods;
         long churned, exports, failures, retries;
+        Dictionary<string, long> reasons;
         lock (_lock)
         {
             pods = [.. _pods];
             (churned, exports, failures, retries) = (_churned, _retiredExports, _retiredFailures, _retiredRetries);
+            reasons = new(_retiredReasons);
         }
         double maxMs = 0;
         long points = 0;
@@ -97,9 +105,11 @@ sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : B
             exports += e; failures += f; retries += r;
             maxMs = Math.Max(maxMs, ms);
             points = Math.Max(points, pts);
+            foreach (var (k, v) in p.FailureReasons()) reasons[k] = reasons.GetValueOrDefault(k) + v;
         }
         var rt = _rt == -2 ? "off" : LabelSet.RtText(_rt);
-        return new FleetStats(pods.Length, _rate, rt, _extra, _churnSeconds, exports, failures, retries, maxMs, points, churned);
+        return new FleetStats(pods.Length, _rate, rt, _extra, _churnSeconds, exports, failures, retries, maxMs, points, churned,
+            _appended, reasons);
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -146,11 +156,14 @@ sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : B
         }
     }
 
-    private SimPod NewPod() => new($"transactions-api-{_rs}-{RandomChars(5)}", _rt, _extra, _endpoint, _intervalMs, _timeoutMs);
+    private SimPod NewPod() => new($"transactions-api-{_rs}-{RandomChars(5)}", _rt, _extra, _appended, _endpoint, _intervalMs, _timeoutMs);
 
-    // A rollout: ~20% of pods go away and new ones (new names, new series) take their place.
+    // A rollout: ~20% of pods go away and new ones (new names, new series) take their place. Retired pods
+    // are disposed in parallel in the background (each dispose flushes a final export, up to the export
+    // timeout), and a tick is skipped while the previous churn is still retiring pods.
     private void Churn()
     {
+        if (Interlocked.Exchange(ref _churning, 1) == 1) return;
         List<SimPod> retired = [];
         lock (_lock)
         {
@@ -162,12 +175,25 @@ sealed class FleetSimulator(IConfiguration cfg, ILogger<FleetSimulator> log) : B
                 _churned++;
             }
         }
-        foreach (var p in retired)
+        _ = Task.Run(async () =>
         {
-            p.Dispose();
-            var (e, f, r, _, _) = p.Export();
-            lock (_lock) { _retiredExports += e; _retiredFailures += f; _retiredRetries += r; }
-        }
+            try
+            {
+                await Task.WhenAll(retired.Select(p => Task.Run(() =>
+                {
+                    p.Dispose();
+                    var (e, f, r, _, _) = p.Export();
+                    var reasons = p.FailureReasons();
+                    lock (_lock)
+                    {
+                        _retiredExports += e; _retiredFailures += f; _retiredRetries += r;
+                        foreach (var (k, v) in reasons) _retiredReasons[k] = _retiredReasons.GetValueOrDefault(k) + v;
+                    }
+                })));
+            }
+            catch (Exception ex) { log.LogWarning(ex, "fleet: retiring churned pods failed"); }
+            finally { Volatile.Write(ref _churning, 0); }
+        });
     }
 }
 
@@ -186,10 +212,13 @@ sealed class SimPod : IDisposable
     private readonly Lock _lock = new();
     private double _due;
 
-    public SimPod(string name, int responseTime, int extraSeries, string endpoint, int intervalMs, int timeoutMs)
+    private readonly KeyValuePair<string, object?>[] _appended;
+
+    public SimPod(string name, int responseTime, int extraSeries, int appendedLabels, string endpoint, int intervalMs, int timeoutMs)
     {
         _name = name;
         _rt = responseTime;
+        _appended = AppendedLabels.For(name, appendedLabels);
         _stats = new ExportStats(intervalMs, timeoutMs);
         var meterName = $"{TransactionMetrics.MeterName}.sim.{name}";
         _meter = new Meter(meterName);
@@ -230,6 +259,8 @@ sealed class SimPod : IDisposable
         return (s.Exports, s.Failures, s.HttpRetries, s.LastExportMs, s.LastPoints);
     }
 
+    public Dictionary<string, long> FailureReasons() => _stats.FailureReasons();
+
     // Record the transactions that are due (fractional rates accumulate across ticks).
     public void Tick(double transactions)
     {
@@ -251,8 +282,11 @@ sealed class SimPod : IDisposable
         // Same shape as the real replicas: 3–60 ms downstream delay plus ~1.7 ms of CPU.
         var seconds = (Random.Shared.Next(3, 60) + 1.7 + Random.Shared.NextDouble()) / 1000.0;
 
-        _duration.Record(seconds, new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } });
+        var durationTags = new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } };
+        foreach (var a in _appended) durationTags.Add(a);
+        _duration.Record(seconds, durationTags);
         var tags = new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product }, { "pod", _name } };
+        foreach (var a in _appended) tags.Add(a);
         if (_rt == LabelSet.Band) tags.Add("response_time", LabelSet.BandOf(seconds));
         else if (_rt >= 0) tags.Add("response_time", Math.Round(seconds, _rt).ToString("F" + _rt, CultureInfo.InvariantCulture));
         _tx.Add(1, tags);

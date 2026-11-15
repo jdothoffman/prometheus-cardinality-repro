@@ -1,10 +1,17 @@
 # Proving the fix: response-time metrics that scale
 
-**Status:** a candidate fix and the plan to test it. Run this *after* the hypothesis is shown reliably (see [next-steps.md](next-steps.md), decision 3). The results so far are in [experiment-log.md](experiment-log.md).
+**Status:** fix runs F1 (SDK allow-list View) and F5 (latency band) passed at L5. The results are in [experiment-log.md](experiment-log.md), and they were checked in [review-2026-11-15.md](review-2026-11-15.md).
 
-## The problem in one line
+> **Production pivot (2026-11-15).** Production **already buckets response time**, so the float label below is not the production cause. It is still the clearest way to reproduce high-cardinality damage, and the fixes here (histograms, allow-list Views, cardinality budgets) apply to any label. For production the remaining suspects are:
+> - the `pod` label and the labels the observability team appends
+> - a raised `CardinalityLimit` across many instruments (run A in the experiment log)
+> - the aggregate of many pods overwhelming the agent (the 300-pod fleet test)
+>
+> The guardrails in section 4 and fix F1 address all three.
 
-`response_time` as a float label makes nearly every request a new time series. At 6 decimal places it behaves like a request ID. Pipeline cost then grows with **request volume** instead of staying fixed.
+## The problem in one line (the repro's bug)
+
+`response_time` as a float label makes nearly every request a new time series. At 6 decimal places it behaves like a request ID. Pipeline cost then grows with **request volume** instead of staying fixed. **In this repo, the cost to the app is the SDK's own state** (about 200k series and a 480 MiB heap per pod), more than any back pressure from the agent.
 
 ## How precision multiplies series
 
@@ -66,9 +73,9 @@ In .NET, choose the buckets and an allow-list of labels in one View. The SDK is 
 - **Label values must come from a small, known set.** Product, state, region and route template are fine. IDs, raw numbers, full URLs and timestamps are never fine.
 - **Do the math before adding a label.** The production shape:
   - 4 × 4 × 10 = 160 combinations
-  - × about 12 series per histogram (10 buckets + sum + count)
-  - ≈ 2,000 series per pod
-  - × 150 pods ≈ 290k series
+  - × 13 series per histogram (10 boundaries = 11 buckets, plus sum and count)
+  - ≈ 2,100 series per pod
+  - × 150 pods ≈ 310k series
   
   That's manageable. Exponential histograms bring it to about 24k. A 6-dp `response_time` label is unbounded.
 - **Per-pod latency is rarely needed.** Keep pod identity on a few health metrics, and aggregate it away on latency histograms, either in the SDK or with Prometheus recording rules.
@@ -123,11 +130,14 @@ Compare against the hypothesis run at the same level and against its control. Th
 |---|---|---|---|
 | Export payload per replica | 66–67 MB, 200k points | at control level, ≈1.2 MB / 8k points | ✅ 1.2 MB / 8.2k |
 | Export failures / retries | 452–455 / 45–68 | 0 / 0 | ✅ 0 / 0 |
-| Alloy | refusing 10.6–11.2k points/s, 0–5 restarts | no restarts, 0 refused | ✅ healthy |
+| Alloy | refusing 10.6–11.2k points/s early, OOMKilled 5–6× (Kubernetes `restartCount`), then idle | no restarts, 0 refused | ✅ healthy |
 | App .NET heap (peak) | 477–482 MiB of 576 MiB | at control level, ≈40 MiB | ✅ 41 MiB |
-| Pod throttling, late quarter | 42–51% | within a few points of control (33%) | ✅ 31% |
-| p95, late quarter | 64–87 ms | within a few ms of control (63 ms) | ✅ 63 ms |
-| Stalls / client errors | 1 stall (p95 1,340 ms), 0 errors | none | ✅ none |
+| Pod throttling, **mean across pods**, t=1030–1200 | 14.7–18.4% | within a few points of control (9.4%) | ✅ 9.6% |
+| Pod throttling, worst pod, late quarter (report statistic) | 42–51% | within a few points of control (33%) | ✅ 31% |
+| p95, late quarter, **median** of per-second p95 | 63.6–63.7 ms | within about 1 ms of control (62.6 ms) | ✅ 62.8 ms |
+| Stalls / client errors | 2 stalls from t=973 (worst p95 1,340 ms), 0 errors | none | ✅ none |
+
+The steady-state CPU and latency differences being fixed are small (review 3.1–3.2). The clear signals F1 removes are the **SDK state** (heap, export size and failures), the **agent damage**, and the **stalls**.
 
 **F5 passed** (run `20261115-134526`):
 

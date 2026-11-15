@@ -58,6 +58,9 @@ sealed class Evidence
     public List<Termination> Terminations { get; set; } = [];
     public List<EventRow> Events { get; set; } = [];
     public List<LogExcerpt> Logs { get; set; } = [];
+    // Why the real replicas' exports failed (summed over replicas, since pod start): "HTTP 413",
+    // "timeout / cancelled", "connection: ConnectionError", "not sent (...)".
+    public Dictionary<string, long> ExportFailureReasons { get; set; } = [];
 }
 
 sealed class RunRecord
@@ -351,6 +354,9 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
         // Traffic window only: EndedAtUnix also covers draining and the wait before the report is built.
         var trafficEnd = t0 + (r.Points.Count == 0 ? 0 : r.Points.Max(p => p.T));
         var during = r.ReplicaSamples.Where(s => s.Ts >= t0 && s.Ts <= trafficEnd).ToList();
+        foreach (var v in replicas)
+            foreach (var (k, n) in v.Stats?.ExportFailureReasons ?? [])
+                ev.ExportFailureReasons[k] = ev.ExportFailureReasons.GetValueOrDefault(k) + n;
         var interval = replicas.Select(v => v.Stats?.ExportIntervalMs ?? 0).FirstOrDefault(v => v > 0);
         var timeout = replicas.Select(v => v.Stats?.ExportTimeoutMs ?? 0).FirstOrDefault(v => v > 0);
         if (interval == 0) interval = 10_000;
@@ -447,7 +453,9 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
         double FailRate(long t) => r.Points.Where(p => p.T > t - 3 && p.T <= t).Sum(p => p.Timeouts + p.HttpErrors + p.ConnErrors + p.Dropped);
         var cpuByT = during.GroupBy(s => s.Ts - t0)
             .Where(g => g.Count(s => s.Reachable && s.CpuCores.HasValue) >= Math.Max(1, expected))
+            // Thr = the MOST throttled replica in each poll (sensitive to one pod); ThrMean = the mean across replicas.
             .Select(g => (T: g.Key, Cpu: g.Where(s => s.Reachable).Sum(s => s.CpuCores ?? 0), Thr: g.Where(s => s.Reachable).Max(s => s.ThrottledPct ?? 0),
+                          ThrMean: g.Where(s => s.Reachable).Average(s => s.ThrottledPct ?? 0),
                           Exp: g.Max(s => s.ExportMaxMs ?? 0)))
             .OrderBy(x => x.T).ToList();
         var early = cpuByT.Where(x => x.T >= 10 && x.T <= dur * 0.4 && FailRate(x.T) == 0 && OkRate(x.T) > 0).ToList();
@@ -484,6 +492,13 @@ sealed class EvidenceCollector(IConfiguration cfg, KubeClient kube, ILogger<Evid
             ev.Facts["soakExportLate"] = Avg(l.Select(x => x.Exp));
             ev.Facts["soakP95Early"] = Avg(pe.Select(p => p.P95));
             ev.Facts["soakP95Late"] = Avg(pl.Select(p => p.P95));
+            // Mean throttling across replicas, and the median of per-second p95: robust to one pod and to a
+            // short stall, which the worst-pod and mean figures above are not (review 2026-11-15, 3.1 and 3.2).
+            ev.Facts["soakThrottleMeanEarly"] = Avg(e.Select(x => x.ThrMean));
+            ev.Facts["soakThrottleMeanLate"] = Avg(l.Select(x => x.ThrMean));
+            static double? Median(IEnumerable<double> v) { var a = v.Order().ToList(); return a.Count == 0 ? null : Math.Round(a[a.Count / 2], 2); }
+            ev.Facts["soakP95MedianEarly"] = Median(pe.Select(p => p.P95));
+            ev.Facts["soakP95MedianLate"] = Median(pl.Select(p => p.P95));
             ev.Facts["soakFailuresLate"] = r.Points.Where(p => p.T >= dur / 2).Sum(p => p.Timeouts + p.HttpErrors + p.ConnErrors + p.Dropped);
         }
     }
@@ -870,7 +885,8 @@ static class Analyzer
                 var exportRose = expL >= Math.Max(10 * (expE ?? 0), 500) || retries > 0;
                 var earlySaturated = cpuE is not null && cpuLimit is not null && cpuE >= 0.85 * cpuLimit;
                 var soakEvidence = $"Constant {r.Config.StartRate:N0} req/s. Early → late: CPU {N(cpuE, "N2")} → {N(cpuL, "N2")} cores, " +
-                    $"throttling {N(thrE)}% → {N(thrL)}%, export {N(expE)} → {N(expL)} ms, p95 {N(p95E)} → {N(p95L)} ms, {failLate:N0} failures in the second half. ";
+                    $"throttling (worst replica) {N(thrE)}% → {N(thrL)}%, mean across replicas {N(fx.GetValueOrDefault("soakThrottleMeanEarly"))}% → {N(fx.GetValueOrDefault("soakThrottleMeanLate"))}%, " +
+                    $"export {N(expE)} → {N(expL)} ms, p95 mean {N(p95E)} → {N(p95L)} ms (median {N(fx.GetValueOrDefault("soakP95MedianEarly"))} → {N(fx.GetValueOrDefault("soakP95MedianLate"))} ms), {failLate:N0} failures in the second half. ";
                 f.Add(new("info", "Soak: early vs late at constant load", soakEvidence));
 
                 // Control at the same rate, duration and agent profile with bounded labels.
@@ -930,6 +946,15 @@ static class Analyzer
         }
 
         // 6. Metrics pipeline.
+        // Alloy restarts: the Prometheus-based delta undercounts while Alloy is down (its own metrics stop),
+        // so also take the container restartCount from the Kubernetes termination records.
+        var alloyKubeRestarts = ev.Terminations.Where(t => t.Namespace == "alloy").Select(t => (double)t.RestartCount).DefaultIfEmpty(0).Max();
+        fx["alloyRestarts"] = Math.Max(fx.GetValueOrDefault("alloyRestartsDelta") ?? 0, alloyKubeRestarts);
+        if (ev.ExportFailureReasons.Count > 0)
+            f.Add(new("info", "Why the app's exports failed",
+                string.Join(", ", ev.ExportFailureReasons.OrderByDescending(x => x.Value).Select(x => $"{x.Key}: {x.Value:N0}")) +
+                ". Counted per HTTP attempt (status code = the request reached the agent; timeout/connection = it did not complete), " +
+                "plus exports that failed before any HTTP request. Summed over the real replicas since they started."));
         if (ev.PrometheusUp)
         {
             var promPct = fx.GetValueOrDefault("promMemPeak") / fx.GetValueOrDefault("promMemLimit");
@@ -937,12 +962,12 @@ static class Analyzer
                 f.Add(new("critical", "Prometheus restarted during the run", $"Memory peaked at {Mib(fx.GetValueOrDefault("promMemPeak"))} of {Mib(fx.GetValueOrDefault("promMemLimit"))}. Likely OOMKilled; check for a WAL-replay crash loop."));
             else if (promPct >= 0.85)
                 f.Add(new("warn", "Prometheus close to its memory limit", $"Peak {Mib(fx.GetValueOrDefault("promMemPeak"))} of {Mib(fx.GetValueOrDefault("promMemLimit"))}."));
-            if (fx.GetValueOrDefault("alloyRestartsDelta") > 0)
-                f.Add(new("critical", "Alloy restarted during the run", $"Memory peaked at {Mib(fx.GetValueOrDefault("alloyMemPeak"))} of {Mib(fx.GetValueOrDefault("alloyMemLimit"))}."));
+            if (fx.GetValueOrDefault("alloyRestarts") > 0)
+                f.Add(new("critical", "Alloy restarted during the run", $"{fx.GetValueOrDefault("alloyRestarts"):N0} restart(s) (Kubernetes restartCount). Memory peaked at {Mib(fx.GetValueOrDefault("alloyMemPeak"))} of {Mib(fx.GetValueOrDefault("alloyMemLimit"))}."));
             if (fx.GetValueOrDefault("alloyRefusedPeak") > 0 || fx.GetValueOrDefault("rwFailedPeak") > 0)
                 f.Add(new("warn", "Metrics were refused or failed to write", $"Alloy refused up to {fx.GetValueOrDefault("alloyRefusedPeak"):N0} points/s; remote_write failed up to {fx.GetValueOrDefault("rwFailedPeak"):N0} samples/s."));
 
-            var pipelineFine = !(fx.GetValueOrDefault("promRestartsDelta") > 0) && !(fx.GetValueOrDefault("alloyRestartsDelta") > 0) && !(promPct >= 0.85);
+            var pipelineFine = !(fx.GetValueOrDefault("promRestartsDelta") > 0) && !(fx.GetValueOrDefault("alloyRestarts") > 0) && !(promPct >= 0.85);
             if (pipelineFine && appTerms.Count > 0)
                 f.Add(new("info", "The metrics pipeline was not the bottleneck",
                     $"Prometheus peaked at {Mib(fx.GetValueOrDefault("promMemPeak"))} ({Pct(fx.GetValueOrDefault("promMemPeak"), fx.GetValueOrDefault("promMemLimit"))} of limit), " +
@@ -971,6 +996,10 @@ static class Analyzer
                 $"(response_time: {fe.ResponseTime}, {fe.ExtraSeries:N0} extra series, up to {fe.PointsPerPod:N0} points per pod per export" +
                 (fe.ChurnSeconds > 0 ? $", ~20% of pods replaced every {fe.ChurnSeconds}s ({fe.Churned:N0} so far)" : "") + "). " +
                 $"During the run: {exports:N0} fleet exports, {failures:N0} failed ({failPct:N1}%), {retries:N0} HTTP retries. " +
+                (fe.AppendedLabels > 0 ? $"Each fleet series carried {fe.AppendedLabels} appended identity labels. " : "") +
+                (fe.FailureReasons is { Count: > 0 } fr
+                    ? "Fleet failure reasons (since fleet start): " + string.Join(", ", fr.OrderByDescending(x => x.Value).Select(x => $"{x.Key}: {x.Value:N0}")) + ". "
+                    : "") +
                 "Fleet series are dropped before Prometheus by the PROTECT_PROM rule; Alloy still receives and converts all of them."));
         }
 

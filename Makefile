@@ -18,11 +18,12 @@ FLEET          := deploy/transactions-fleet
 FLEET_REPLICAS ?= 2
 FLEET_NODE_MEM ?= 1792m
 FLEET_NODE_CPUS ?= 2
+N              ?= 0
 
 .PHONY: help prereqs up monitoring agent app all ui load load-stop load-logs explode calm churn \
         unchurn reset-prometheus agent-down agent-up guard-agent unguard-agent fix-app unfix-app \
         cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports agent-normal agent-constrained \
-        fleet-node fleet-on fleet-off prod-pods lab-pods
+        fleet-node fleet-on fleet-off prod-pods lab-pods appended-labels
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -132,6 +133,11 @@ fleet-off: ## Stop the simulated fleet
 
 prod-pods: ## Production-like pod label: each real replica stamps only its own pod name (VIRTUAL_PODS=1)
 	$(K) -n demo set env $(APP) VIRTUAL_PODS=1
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+appended-labels: ## Append N (0-8) identity labels (k8s node, pod uid, container id, ...) to every series, real replicas + fleet: N=4
+	$(K) -n demo set env $(APP) APPENDED_LABELS=$(N)
+	-$(K) -n demo set env $(FLEET) FLEET_APPENDED_LABELS=$(N) 2>/dev/null
 	$(K) -n demo rollout status $(APP) --timeout=180s
 
 lab-pods: ## Back to 50 simulated pod names per real replica (the L1-L5 setting)

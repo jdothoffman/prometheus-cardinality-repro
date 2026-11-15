@@ -256,6 +256,9 @@ sealed class LoadTest
                 ? new LabelConfig(current.Labels!.Where(l => l != "response_time").ToArray(), current.ResponseTimeDecimals, 0, 0)
                 : current;
             _modeAtStart = Labels.Describe(_labelsAtStart);
+            // Identity labels appended to every series (APPENDED_LABELS on the api replicas) are part of the label set.
+            var appended = _replicas.Latest.Select(v => v.Stats?.AppendedLabels ?? 0).DefaultIfEmpty(0).Max();
+            if (appended > 0) _modeAtStart += $", +{appended} appended identity labels";
             _agentProfile = _pipeline.AgentProfile;
             _fleetAtStart = _config.DryRun ? null : _pipeline.Fleet;
             var name = (c.Name ?? "").Trim();
@@ -907,9 +910,12 @@ sealed class PipelineMonitor(IConfiguration cfg, ILogger<PipelineMonitor> log) :
         }));
         var ok = parts.Where(p => p is not null).Select(p => p!).ToList();
         if (ok.Count == 0) return null;
+        var reasons = new Dictionary<string, long>();
+        foreach (var p in ok)
+            foreach (var (k, v) in p.FailureReasons ?? []) reasons[k] = reasons.GetValueOrDefault(k) + v;
         return new FleetStats(ok.Sum(p => p.Pods), ok[0].RatePerPod, ok[0].ResponseTime, ok[0].ExtraSeries, ok[0].ChurnSeconds,
             ok.Sum(p => p.Exports), ok.Sum(p => p.ExportFailures), ok.Sum(p => p.HttpRetries),
-            ok.Max(p => p.MaxLastExportMs), ok.Max(p => p.PointsPerPod), ok.Sum(p => p.Churned));
+            ok.Max(p => p.MaxLastExportMs), ok.Max(p => p.PointsPerPod), ok.Sum(p => p.Churned), ok[0].AppendedLabels, reasons);
     }
 
     // End-to-end checks for the dry run: app -> OTLP -> Alloy -> remote_write -> Prometheus -> Grafana.
