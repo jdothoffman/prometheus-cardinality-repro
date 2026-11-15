@@ -158,6 +158,7 @@
           <select id="rtDecimals" title="response_time precision">
             <option value="6">6 dp ≈ unique</option><option value="3">3 dp ≈ 1 ms</option>
             <option value="2">2 dp ≈ 10 ms</option><option value="1">1 dp ≈ 100 ms</option>
+            <option value="-1">band (5 fixed values)</option>
           </select></label>
       </div>
       <div class="extras">
@@ -375,7 +376,7 @@ function render(data) {
   $('modeNote').textContent = data.replicas.observed === 'mixed'
     ? 'Replicas disagree (one is restarting?). Click Apply labels to re-apply.'
     : labelsDirty ? 'Not applied yet. Click Apply labels.'
-    : rtOn ? `Now: ${data.replicas.currentDescription}. response_time at ${cur0.responseTimeDecimals} dp ${cur0.responseTimeDecimals >= 4 ? 'makes nearly every request a new series' : 'is bucketed'}. Removing a label does not free series already in SDK memory: click Restart replicas.`
+    : rtOn ? `Now: ${data.replicas.currentDescription}. response_time ${cur0.responseTimeDecimals === -1 ? 'as 5 fixed latency bands is bounded' : `at ${cur0.responseTimeDecimals} dp ${cur0.responseTimeDecimals >= 4 ? 'makes nearly every request a new series' : 'is bucketed'}`}. Removing a label does not free series already in SDK memory: click Restart replicas.`
     : `Now: ${data.replicas.currentDescription}. Series already created stay in SDK memory until Restart replicas.`;
 
   const running = t.state !== 'idle';
@@ -465,7 +466,7 @@ function renderReplicas(pods) {
     const memPct = s.memoryLimitBytes ? 100 * s.memoryCurrentBytes / s.memoryLimitBytes : null;
     const rt = (s.labels || []).includes('response_time');
     const status = !v.reachable ? `<span class="tag bad">${v.lastError || 'down'}</span>`
-      : `<span class="tag ${rt ? 'bad' : 'ok'}" title="${esc((s.labels || []).join(', '))}">${(s.labels || []).length} labels${rt ? ` · rt ${s.responseTimeDecimals}dp` : ''}</span>`;
+      : `<span class="tag ${rt ? 'bad' : 'ok'}" title="${esc((s.labels || []).join(', '))}">${(s.labels || []).length} labels${rt ? ` · rt ${s.responseTimeDecimals === -1 ? 'band' : s.responseTimeDecimals + 'dp'}` : ''}</span>`;
     const exTo = s.exportTimeoutMs || 8000;
     return `<tr>
       <td class="mono">${s.pod || v.ip}</td><td>${status}</td>

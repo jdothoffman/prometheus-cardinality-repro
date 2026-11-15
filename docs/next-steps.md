@@ -1,6 +1,6 @@
 # Next steps: picking up the experiment
 
-**Paused:** 2026-11-14, after the L4 repeat. Results and evidence are in [experiment-log.md](experiment-log.md).
+**Updated:** 2026-11-15, after L5. Results and evidence are in [experiment-log.md](experiment-log.md).
 
 ## Where we are
 
@@ -9,10 +9,15 @@
   - Each replica then sends 35–67 MB per export, every 10s.
   - Exports time out and retry, and Alloy is OOMKilled 4–6 times per run.
   - App heap reaches 83–85% of its GC limit.
-- **Not yet systematic:** that pressure degrading the live app.
-  - The first L4 run (constrained agent, 70% load) had a 10s outage across all replicas, with a clean control.
-  - The identical repeat had 0 errors.
-  - So far, 1 of 2 runs.
+- **Getting there:** that pressure degrading the live app. **2 of 3 constrained-agent hypothesis runs degraded, and every control was clean.**
+
+  | Level | Load | Hypothesis result | Control |
+  |---|---|---|---|
+  | L4 | 70% | 10 s outage, 2,205 timeouts | clean |
+  | L4 repeat | 70% | no degradation | clean (some noise) |
+  | **L5** | **80%** | **2 s stall** (p95 1,340 ms, 0 errors). Late-run throttling 42% vs 33% and p95 87 vs 63 ms. | clean |
+
+  The degradation is consistent but small. A *stall*, and a lasting slowdown, are shown. A reliable *outage* is not.
 - **Ruled out as the main cause:** GC (at most 3.2% pause).
 - **Still possible:** background CPU contention in the cluster. A control run alone showed throttling bursts.
 
@@ -25,7 +30,8 @@
 | Agent profile | **constrained + protect** (Alloy 250m CPU / 384Mi, memory_limiter, `response_time`/GUID series dropped before Prometheus) |
 | App | 4 replicas, `CPU_WORK_ITERATIONS=1000` (≈ 2,350 req/s capacity), bounded labels |
 | Run history | On the driver's PVC (survives restarts). HTML copies are in `./reports/` (gitignored). |
-| Git | `main` has **uncommitted** changes: `docs/experiment-log.md` (L4 repeat results) and this file. `main` requires a PR, so these need a branch and a PR. The merged branch `feature/stall-verdict-gc` can be deleted. |
+| Node CPUs | App nodes at **4 CPUs** since L5 (`APP_NODE_CPUS=4 make node-cpus`). This is not the Makefile default of 3, so pass the variable again if you re-create the cluster. |
+| Git | `docs/` changes after PR #7 (L5 results, [proving-the-fix.md](proving-the-fix.md)) are uncommitted. |
 
 ## Resume
 
@@ -50,6 +56,10 @@ If the CPU caps on the nodes were lost (check with `docker inspect k3d-cardinali
 
 ### 1. Which experiment next? (main decision)
 
+> **Update after L5:** option C (more CPU per app node) is done, and L5 is done. **Recommended next: two more L5 hypothesis runs** (≈ 22 min each; L5 control can be reused). Run them as a single **Run hypothesis** in the console, or repeat that click. If at least one degrades, L5 meets the "≥2 of 3" bar, and you can move on to the fix runs in [proving-the-fix.md](proving-the-fix.md).
+
+Original options (2026-11-14):
+
 | Option | What it tells us | Time |
 |---|---|---|
 | **A. More L4 repeats** (2–3 more hypothesis runs) | How often the outage happens at 70% load | ≈ 18 min per run |
@@ -71,6 +81,8 @@ If the CPU caps on the nodes were lost (check with `docker inspect k3d-cardinali
 Agree on this *before* the next runs, so the results can't be read to fit. Suggested bar: an outage in **≥ 2 of 3 hypothesis runs**, with **every matching control clean**.
 
 ### 4. Step labels down now, or wait?
+
+The step-down is now run F3 in [proving-the-fix.md](proving-the-fix.md).
 
 The original plan was to step labels down once app degradation was reliable. But the **pipeline-side** damage is reliable already, so the step-down could be measured against pipeline metrics instead:
 

@@ -245,13 +245,27 @@ sealed class LabelSet
     public string Mode => Has("response_time") ? "unbounded" : "bounded";
     public string Key => KeyOf(_s.Enabled, _s.RtDecimals, _s.ExtraCount, _s.ExtraPool);
 
+    // response_time "precision" Band (-1): instead of a rounded float, a label with a fixed set of latency
+    // bands. The bounded alternative for teams that want latency as a label (cardinality x5 at most).
+    public const int Band = -1;
+    public static readonly string[] BandValues = ["0-50ms", "50-250ms", "250ms-1s", "1-3s", "3s+"];
+    public static string BandOf(double seconds) => seconds switch
+    {
+        < 0.05 => BandValues[0],
+        < 0.25 => BandValues[1],
+        < 1 => BandValues[2],
+        < 3 => BandValues[3],
+        _ => BandValues[4],
+    };
+    public static string RtText(int rtDecimals) => rtDecimals == Band ? "band" : $"{rtDecimals}dp";
+
     public static string KeyOf(string[] enabled, int rtDecimals, int extra, int pool) =>
         string.Join(",", enabled) + (enabled.Contains("response_time") ? $"@{rtDecimals}" : "") + (extra > 0 ? $"+{extra}x{pool}" : "");
 
     public string Describe()
     {
         var s = _s;
-        var d = string.Join(", ", s.Enabled.Select(l => l == "response_time" ? $"response_time({s.RtDecimals}dp)" : l));
+        var d = string.Join(", ", s.Enabled.Select(l => l == "response_time" ? $"response_time({RtText(s.RtDecimals)})" : l));
         return s.ExtraCount > 0 ? $"{d}, +{s.ExtraCount} GUID labels ({(s.ExtraPool == 0 ? "unique" : $"pool {s.ExtraPool:N0}")})" : d;
     }
 
@@ -263,7 +277,7 @@ sealed class LabelSet
     {
         var cur = _s;
         var enabled = c.Labels is { } labels ? All.Where(l => labels.Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray() : cur.Enabled;
-        var rt = c.ResponseTimeDecimals is { } d ? Math.Clamp(d, 0, 6) : cur.RtDecimals;
+        var rt = c.ResponseTimeDecimals is { } d ? Math.Clamp(d, Band, 6) : cur.RtDecimals;
         var n = c.ExtraLabels is { } x ? Math.Clamp(x, 0, ExtraNames.Length) : cur.ExtraCount;
         var k = c.ExtraPoolSize is { } y ? Math.Clamp(y, 0, MaxPool) : cur.ExtraPool;
         var pools = n == cur.ExtraCount && k == cur.ExtraPool && c.ExtraLabels is null ? cur.Pools
@@ -367,9 +381,12 @@ sealed class TransactionMetrics
         if (Has("product")) tags.Add("product", product);
         if (Has("pod")) tags.Add("pod", _pods.Pick());
         // THE BUG: response time as a float LABEL. At 6 decimals nearly every request creates a new series;
-        // lowering the precision buckets it (3 dp ≈ 1ms buckets, 2 dp ≈ 10ms, 1 dp ≈ 100ms).
+        // lowering the precision buckets it (3 dp ≈ 1ms buckets, 2 dp ≈ 10ms, 1 dp ≈ 100ms). Band (-1) uses
+        // 5 fixed latency bands instead: bounded no matter how latency spreads under load.
         if (Has("response_time"))
-            tags.Add("response_time", Math.Round(elapsed.TotalSeconds, rtDecimals).ToString("F" + rtDecimals, CultureInfo.InvariantCulture));
+            tags.Add("response_time", rtDecimals == LabelSet.Band
+                ? LabelSet.BandOf(elapsed.TotalSeconds)
+                : Math.Round(elapsed.TotalSeconds, rtDecimals).ToString("F" + rtDecimals, CultureInfo.InvariantCulture));
         // Extra GUID labels: unique per request, or from a fixed pool per label.
         for (var i = 0; i < extra; i++)
         {
