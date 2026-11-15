@@ -696,7 +696,7 @@ static class Labels
 {
     public static LabelConfig Normalize(LabelConfig c) => new(
         LabelSet.All.Where(l => (c.Labels ?? []).Contains(l, StringComparer.OrdinalIgnoreCase)).ToArray(),
-        Math.Clamp(c.ResponseTimeDecimals ?? 6, 0, 6),
+        Math.Clamp(c.ResponseTimeDecimals ?? 6, LabelSet.Band, 6),
         Math.Clamp(c.ExtraLabels ?? 0, 0, LabelSet.ExtraNames.Length),
         Math.Clamp(c.ExtraPoolSize ?? 0, 0, LabelSet.MaxPool));
 
@@ -709,7 +709,7 @@ static class Labels
     public static string Describe(LabelConfig c)
     {
         var d = (c.Labels ?? []).Length == 0 ? "(no labels)"
-            : string.Join(", ", (c.Labels ?? []).Select(l => l == "response_time" ? $"response_time({c.ResponseTimeDecimals ?? 6}dp)" : l));
+            : string.Join(", ", (c.Labels ?? []).Select(l => l == "response_time" ? $"response_time({LabelSet.RtText(c.ResponseTimeDecimals ?? 6)})" : l));
         var n = c.ExtraLabels ?? 0;
         return n > 0 ? $"{d}, +{n} GUID labels ({((c.ExtraPoolSize ?? 0) == 0 ? "unique" : $"pool {c.ExtraPoolSize:N0}")})" : d;
     }

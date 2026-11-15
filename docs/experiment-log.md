@@ -1,10 +1,15 @@
 # Experiment log: metrics pressure vs the live app
 
-**Date:** 2026-11-14 · **Environment:** local k3d cluster (this repo) · **Status:** L1–L4 complete, plus an L4 repeat. **App degradation was seen in 1 of 2 identical L4 runs (not yet systematic)**
+**Date:** 2026-11-14 · **Environment:** local k3d cluster (this repo) · **Status:** L1–L5 complete, plus an L4 repeat. **App degradation was seen in 2 of 3 constrained-agent hypothesis runs (L4: 1 of 2, L5: 1 of 1). All controls were clean.**
 
 ## TL;DR
 
-- **App degradation: seen once, not reproduced.**
+- **L5 (2026-11-15, 80% load, app nodes at 4 CPUs): CONFIRMED, but mild.**
+  - **Stall:** a 2-second stall at t=976s. All 4 replicas hit their 1-core CPU limit together, with throttling at 77–96%. p95 reached 1,340 ms, there were 0 failed requests, and 7 seconds were above 250 ms. The control had none.
+  - **Steady-state cost:** in the last quarter of the run, throttling was 42% against the control's 33%, and p95 was 87 ms against 63 ms.
+  - **Pipeline:** the same damage as L4: 452 export failures, Alloy OOMKilled 5×, heap 482 MiB.
+  - **What we can claim:** the metrics pressure makes the app measurably slower and more prone to stalls. That it reliably causes *outages* is not yet shown.
+- **L4 app degradation: seen once, not reproduced.**
   - **First L4 run** (constrained agent, a constant 1,650 req/s = 70% load): **all 4 replicas went down for about 10 seconds**. p95 reached 3s, there were 2,205 timeouts, and pods were pinned at their 1-core CPU limit while requests alone needed about 70% of it. Export pressure started 2 minutes before the stall, and the control was clean. Re-analysis says CONFIRMED.
   - **L4 repeat**, with identical settings: **0 errors**, flat latency. The pipeline-side pressure was the same or stronger (330 export failures, 56 retries, Alloy refusing up to 18.6k points/s and OOMKilled 6×, app heap 477 MiB).
   - **New GC data** from the repeat: GC paused at most **3.2%** of wall time, so GC isn't a major factor.
@@ -17,10 +22,94 @@
 - **With the normal agent, the app was never harmed (L1–L3).** The normal Alloy *crashes*, after which exports fail instantly and the app's export work actually gets *lighter*. The constrained agent *refuses and slows* (503s), so the app retries and keeps that work going: the only condition under which an outage was seen.
 - **Memory pressure is real but capped.** The app's .NET heap rose to **476–488 MiB (83–85% of the 576 MiB GC limit)**, then leveled off when the SDK's 200k-series cap was reached. A run with the cap applied to every instrument (run A) did exhaust the heap: `OutOfMemoryException` and a total outage, **with no `OOMKilled` visible in Kubernetes**.
 - **The pipeline does not self-heal.** After L1–L3, Alloy kept crash-looping until the app pods restarted. Apps holding cumulative series keep re-sending huge payloads.
-- **Next:**
-  1. Run L4 hypothesis 2–3 more times to measure how often the outage happens.
-  2. And/or L5 (80% load, 20 min, constrained), where there's less CPU headroom.
-  3. Only once degradation is reliable: step labels back down.
+- **Next:** repeat L5 hypothesis twice to apply the "≥2 of 3" bar. Then prove the fix with the runs in [proving-the-fix.md](proving-the-fix.md).
+
+## How we recreated it, and how it shows impact on the running app
+
+In this repo, `transactions-api` plays the part of the production app. It serves live HTTP transactions with a 3s client timeout, and it ships its metrics the way production does: OTel SDK → Alloy agent on its own node pool → Prometheus.
+
+### The causal chain we're testing
+
+```
+bad labels in app code ──► more series in the app's OTel SDK ──► bigger export every 10s (built in the app pod)
+        │                                                              │
+        │                                  agent can't keep up ◄───────┘
+        │                                  (refuses / slows / OOMs)
+        ▼                                          │
+app pod spends CPU + heap on metrics ◄── retries, payloads held in memory
+        │
+        ▼
+less CPU left for requests ──► throttling ──► higher latency ──► stalls / timeouts
+```
+
+### Why the runs isolate the metrics as the cause
+
+Each level is a **control / hypothesis pair** run back to back on the same cluster:
+
+- **Identical in both runs:**
+  - code and image, replicas and CPU/memory limits
+  - nodes, agent profile and Prometheus
+  - request rate (constant, not a ramp) and duration
+  - a full reset first (app, Alloy and Prometheus restarted, with fresh series)
+- **The only difference:** the labels on one metric.
+  - Control: `consume_type, state, product, pod`.
+  - Hypothesis: those, plus `response_time` at 6 dp and 5 unique GUID labels.
+
+So any difference in the app's CPU, heap, throttling or latency comes from the labels.
+
+Each step of the chain is measured **inside the app pods**, not inferred from dashboards:
+
+| Link in the chain | Measured by | L5 control → hypothesis |
+|---|---|---|
+| Series per export | wrapped OTLP exporter (points per export) | 8.2k → **200k** points |
+| Export payload | the exporter's HTTP handler (bytes sent) | 1.2 MB → **67 MB** every 10s |
+| Agent push-back | exporter failures and retries; Alloy's refused-points metric | 0 → **452 failures / 45 retries**; Alloy refusing up to 11k points/s, OOMKilled 5× |
+| App memory | .NET GC heap, polled from each pod | 41 → **482 MiB** (84% of the GC limit) |
+| App CPU contention | the pod's cgroup `cpu.stat`: share of time throttled at its 1-core limit | **33% → 42%** (last quarter) |
+| Live traffic | the load driver's own clients | p95 **63 → 87 ms** (last quarter); a **2s stall at p95 1,340 ms**; 0 failed requests |
+
+### Other explanations, and why they were ruled out
+
+- **Too much load:** requests alone needed about 3.17 of the 4 CPU cores (about 1.67 ms of CPU per request, measured in each run). The control ran the same load cleanly.
+- **Prometheus or Grafana stealing CPU:** `PROTECT_PROM=1` drops the high-cardinality series in Alloy before remote write, so Prometheus sees about the same load in both runs (head series: 125k in the control, 109k in the hypothesis).
+- **GC pauses:** at most 3.6% of wall time, about 0.15% on average.
+- **Background noise on the nodes:** every control was clean. For L5, the app nodes were also given 4 CPUs instead of 3 to reduce that noise.
+
+### What it does and doesn't show
+
+**Shown:**
+
+- High-cardinality labels make the running app pay for its own metrics in CPU and memory.
+- When the agent pushes back (refuses or slows), that cost competes with live requests and makes the app measurably slower: +9 points of throttling and +24 ms p95 at 80% load.
+- That cost also makes stalls more likely: 2 of 3 constrained-agent hypothesis runs.
+
+**Not (yet) shown:**
+
+- That outages are *reliable*: only one run (L4) had timeouts.
+- That this is what happened in production. That depends on the production facts in [next-steps.md](next-steps.md), decision 5: agent sizing, OTel retry setting, cardinality limit and CPU headroom.
+
+**Depends on conditions:** with a generously sized agent that just crashes (L1–L3), exports fail fast and the app was never harmed.
+
+### Recreate from scratch
+
+```sh
+make prereqs                        # k3d + helm (Homebrew)
+APP_NODE_CPUS=4 make up             # cluster: control plane, 2 app nodes (4 CPUs each), tainted agent node
+make monitoring                     # Prometheus (1 GiB, remote-write receiver) + Grafana + dashboards
+make agent-constrained PROTECT_PROM=1   # Alloy: 250m CPU / 384 Mi, memory_limiter, drops bad series before Prometheus
+make app                            # build + deploy transactions-api (4 replicas) and the load-test driver
+make ui                             # console :8080, Grafana :3000, Prometheus :9090
+```
+
+Then, in the console (http://localhost:8080):
+
+1. Open **Hypothesis tests** and set the capacity to 2,350.
+2. Choose **L5**.
+3. Click **Run control** and wait for its report (about 22 min).
+4. Click **Run hypothesis** (about 22 min). Each run resets everything first.
+5. Compare the two reports, or `make reports` and open the files in `./reports/`.
+
+The hypothesis report's verdict section reports the control run it compared against.
 
 ---
 
@@ -33,19 +122,19 @@ It has two parts, and they're tested separately:
 | Part | Question | Status |
 |---|---|---|
 | **A** | Does cardinality create back pressure on the metrics pipeline (agent)? | ✅ Reproduced (L1, L2) |
-| **B** | Does that back pressure degrade the live app? | ⚠️ **Intermittent.** A 10s outage of all replicas in the first L4 run (constrained agent); **not reproduced** in the L4 repeat. ❌ Never with the normal agent (L1–L3) |
+| **B** | Does that back pressure degrade the live app? | ✅ **Shown with the constrained agent, mostly as a slowdown.** L5: +9 points of throttling and +24 ms p95 against its control, plus a 2s stall. L4: a 10s outage in 1 of 2 runs. ❌ Never with the normal agent (L1–L3) |
 
 ## 2. Setup
 
 | Component | Configuration |
 |---|---|
-| Cluster | k3d on Docker Desktop (8 GB VM). Control-plane node, **2 app-pool nodes** (2.25 GB each, capped at **3 real CPUs**), **1 agent-pool node** (1.25 GB, 2 CPUs, tainted, Alloy only) |
+| Cluster | k3d on Docker Desktop (8 GB VM). Control-plane node, **2 app-pool nodes** (2.25 GB each, capped at **3 real CPUs** for L1–L4 and **4 CPUs from L5**), **1 agent-pool node** (1.25 GB, 2 CPUs, tainted, Alloy only) |
 | App | .NET 10 `transactions-api`, **4 replicas**, each **1 CPU / 768 Mi** limit. .NET GC heap hard limit = 75% of the container limit = **576 MiB** |
 | Simulated pods | 50 virtual `pod` label values per replica = **200 pods** |
 | Request cost | `CPU_WORK_ITERATIONS=1000` ⇒ **≈1.7 ms CPU per request** ⇒ capacity **≈2,350–2,410 req/s**, measured in every report and limited by the 4 × 1-core CPU limits |
 | OTel SDK | 1.21, **cumulative** temporality, OTLP/HTTP, export **every 10s**, timeout **8s**, `OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=in_memory` |
 | Cardinality limit | `OTEL_CARDINALITY_LIMIT=200000`, **scoped to `http.transactions` only** (`OTEL_CARDINALITY_LIMIT_SCOPE=transactions`) |
-| Metric | `http_transactions_total{consume_type(4), state(5), product(10), pod(200), [response_time], [GUID labels]}` |
+| Metric | `http_transactions_total{consume_type(4), state(4), product(10), pod(200), [response_time], [GUID labels]}` |
 | Agent | Grafana Alloy v1.21.3, "normal" profile: 1 GiB, no CPU limit, batch 10s, OTLP receiver max request 64 MiB → remote_write |
 | Prometheus | 1 GiB limit. `PROTECT_PROM=1` means Alloy drops high-cardinality series just before remote_write, so Prometheus and Grafana stay up while the app → agent path is unchanged |
 | Load | In-cluster .NET driver, open-model arrival rate, **3s client timeout**. Business outcomes are all HTTP 200, so every error is overload |
@@ -72,7 +161,7 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 | **L2** ✅ | 60% (1,400 req/s) | 10 min | + 3 unique GUID labels | normal |
 | **L3** ✅ | 70% (1,650 req/s) | 15 min | + 5 unique GUID labels | normal |
 | **L4** ⚠️ ×2 | 70% (1,650 req/s) | 15 min | + 5 unique GUID labels | constrained (250m CPU / 384 Mi + memory_limiter) |
-| L5 | 80% (1,900 req/s) | 20 min | + 5 unique GUID labels | constrained |
+| **L5** ✅ | 80% (1,900 req/s) | 20 min | + 5 unique GUID labels | constrained (app nodes at 4 CPUs) |
 
 **Rule:** if the app stays healthy (verdict NOT CONFIRMED or PARTIAL), the level passes and the next one runs.
 
@@ -183,19 +272,50 @@ Each report compares the first and last quarter of the run (after a 60s warm-up)
 
 **Reading the two L4 pairs together.** The pipeline side reproduced exactly: the same failures, retries, refusals, OOMKills and heap. The app outage did not. GC was negligible in the repeat. Both the repeat control and the first hypothesis run show that these 3-CPU nodes see bursts of CPU contention with or without metrics pressure. The first outage is therefore best described as **metrics pressure coinciding with (and possibly amplifying) a contention burst**, not a deterministic effect at this level.
 
-### L1 → L4 trend (hypothesis runs)
+### L5: 1,900 req/s, 20 min, `response_time` + 5 unique GUID labels, constrained agent (2026-11-15)
 
-| | L1 | L2 | L3 | **L4** |
-|---|---|---|---|---|
-| Load | 1,400 req/s (60%) | 1,400 req/s (60%) | 1,650 req/s (70%) | 1,650 req/s (70%) |
-| Extra labels | — | 3 GUIDs | 5 GUIDs | 5 GUIDs |
-| Agent | normal | normal | normal | **constrained** |
-| Peak export payload | 34.9 MB | 67.1 MB | 67.06 MB (ceiling) | 67.0 MB |
-| Export failures / retries | 54 / 18 | 94 / 34 | 259 / 13 | 334 / **67** |
-| Alloy | OOMKilled 4× | OOMKilled 5× | OOMKilled 4× + crash loop | **refusing 10.7k pts/s**, then OOMKilled 6× |
-| Peak app heap | 153 MiB | 383 MiB | 476 MiB (83%) | 488 MiB (85%) |
-| Peak pod throttling (direct polls) | 52% | 56% | 100% | 95% (cAdvisor 33–64% during the stall) |
-| **App p95 / client errors** | flat / 0 | flat / 0 | flat / 0 | **3,000 ms / 2,205 timeouts** (first run); flat / 0 (repeat) |
+**Changed before this run:** app nodes went from 3 to 4 CPUs (`APP_NODE_CPUS=4 make node-cpus`) to cut background contention. The app's own 1-core limit per replica is unchanged. The agent profile was constrained + protect.
+
+| | Control (bounded) | **Hypothesis** |
+|---|---|---|
+| Requests | 2,280,002 ok, 0 failed, worst 1-s p95 177 ms | 2,280,018 ok, **0 failed**, worst 1-s p95 **1,340 ms** |
+| Degradation / stall | none (0 s above 250 ms) | **2 s at p95 ≥ 1 s** (t=976–977), 7 s above 250 ms |
+| p95 early → late | 63 → 63 ms | 63 → **87 ms** |
+| App CPU early → late | 3.13 → 3.15 cores | 3.18 → 3.20 cores |
+| Pod throttling early → late | 34% → 33% | 34% → **42%** |
+| .NET heap (peak) | 41 MiB | **482 MiB** (84% of the GC limit) |
+| GC pause | peak 0.6%, 23 gen2 | peak 3.6%, avg 0.15%, 40 gen2 |
+| Export pressure | none; 1.2 MB, 8.2k points | began at t=42s; peak 8,014 ms, **452 failures / 45 retries**, 200k points / 67.0 MB |
+| Alloy (constrained) | 297 MiB, 0 refused | **refused up to 11,162 points/s**, OOMKilled 5× (all in the first ~4 min) |
+| Verdict | healthy | **CONFIRMED: transient outage at constant load** (control clean) |
+
+**What the stall looked like** (from the driver's 2-second pod polls):
+
+- **Before:** exports had been failing fast (about 25–80 ms) since about t=330s. Alloy was alive (about 50 MiB) but rejecting.
+- **t≈972s:** in-flight requests rose from about 70 to 1,650.
+- **t=974–979s:** **all four replicas** were at 0.96–1.01 cores, throttled 67–96%.
+- **During the stall:** the two replicas that exported at t=976 took 1,057 ms and 1,240 ms to do it, against about 30 ms just before. The exports at t=981–985 took 480–750 ms.
+- **By t≈983s:** latency had recovered.
+
+**Interpretation:**
+
+- The stall happened while every replica was carrying the metrics overhead. The 200k-point payload is still built every 10 seconds even when the agent rejects it, so headroom was about 20%. Something then pushed all four replicas over the limit at once.
+- The slow exports *during* the stall may be a symptom of the CPU contention rather than its trigger. They don't show that the exports started it.
+- The **steady-state** difference is the stronger evidence: +9 points of throttling and +24 ms of p95 in the last quarter of the run, at identical load, with a clean control.
+
+### L1 → L5 trend (hypothesis runs)
+
+| | L1 | L2 | L3 | **L4** | **L5** |
+|---|---|---|---|---|---|
+| Load | 1,400 req/s (60%) | 1,400 req/s (60%) | 1,650 req/s (70%) | 1,650 req/s (70%) | 1,900 req/s (80%) |
+| Extra labels | — | 3 GUIDs | 5 GUIDs | 5 GUIDs | 5 GUIDs |
+| Agent | normal | normal | normal | **constrained** | **constrained** (nodes at 4 CPUs) |
+| Peak export payload | 34.9 MB | 67.1 MB | 67.06 MB (ceiling) | 67.0 MB | 67.0 MB |
+| Export failures / retries | 54 / 18 | 94 / 34 | 259 / 13 | 334 / **67** | 452 / 45 |
+| Alloy | OOMKilled 4× | OOMKilled 5× | OOMKilled 4× + crash loop | **refusing 10.7k pts/s**, then OOMKilled 6× | refusing 11.2k pts/s, OOMKilled 5× |
+| Peak app heap | 153 MiB | 383 MiB | 476 MiB (83%) | 488 MiB (85%) | 482 MiB (84%) |
+| Peak pod throttling (direct polls) | 52% | 56% | 100% | 95% (cAdvisor 33–64% during the stall) | 100% (all 4 replicas during the stall) |
+| **App p95 / client errors** | flat / 0 | flat / 0 | flat / 0 | **3,000 ms / 2,205 timeouts** (first run); flat / 0 (repeat) | **1,340 ms stall (2 s) / 0**; late-quarter p95 87 vs 63 ms in control |
 
 ### L1 → L2: what the GUID labels changed
 
@@ -277,6 +397,8 @@ All reports are in `./reports/` (gitignored). Refresh them with `make reports`, 
 
 | Run | Report file |
 |---|---|
+| **L5 hypothesis** (stall) | `reports/20261115-121217-l5-hypothesis-1900-req-s-20m-constrained.html` |
+| L5 control | `reports/20261115-114959-l5-control-1900-req-s-20m-constrained-ag.html` |
 | L4 repeat hypothesis | `reports/20261114-203146-l4-repeat-hypothesis-1650-req-s-15m-cons.html` |
 | L4 repeat control | `reports/20261114-201541-l4-repeat-control-1650-req-s-15m-constra.html` |
 | **L4 hypothesis** (outage) | `reports/20261114-193930-l4-hypothesis-1650-req-s-15m-constrained.html` |
