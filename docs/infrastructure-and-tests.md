@@ -252,7 +252,7 @@ kubectl --context k3d-cardinality -n demo set env deploy/transactions-api \
 # then a prepared run (Reset everything + soak); the restarted pods keep the env
 ```
 
-Measures the heap the SDK reserves at startup against the 576 MiB GC limit, and whether the app survives load. Restore with `OTEL_CARDINALITY_LIMIT=200000 OTEL_CARDINALITY_LIMIT_SCOPE=transactions`. Criteria and results: experiment log, section 4c.
+Measures the heap the SDK reserves against the 576 MiB GC limit, and whether the app survives load. Read the heap under load: with no traffic, `/admin/stats` shows the heap as of the last GC, which can predate the SDK's allocation. Restore with `OTEL_CARDINALITY_LIMIT=200000 OTEL_CARDINALITY_LIMIT_SCOPE=transactions`. Criteria and results: experiment log, section 4c.
 
 ### Reports
 
