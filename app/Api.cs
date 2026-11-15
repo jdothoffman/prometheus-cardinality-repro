@@ -19,6 +19,8 @@
 //                                all: limit applies to every instrument. The SDK pre-allocates storage
 //                                sized by the limit per stream, so "all" reserves most of the heap.
 //   OTEL_ALLOWED_TAGS            comma list; if set, transaction metrics keep only these tag keys (app fix)
+//   APPENDED_LABELS              0-8 identity labels (k8s node, pod uid, container id, ...) added to every
+//                                transaction series, as an observability team might append them (default 0)
 //   OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_METRIC_EXPORT_INTERVAL / OTEL_METRIC_EXPORT_TIMEOUT
 
 using System.Diagnostics;
@@ -68,7 +70,7 @@ static class Api
                         MetricStreamConfiguration config = instrument.Name == TransactionMetrics.DurationName
                             ? new ExplicitBucketHistogramConfiguration
                             {
-                                Boundaries = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+                                Boundaries = TransactionMetrics.DurationBoundaries,
                             }
                             : new MetricStreamConfiguration();
 
@@ -305,7 +307,8 @@ sealed class VirtualPods
     {
         var parts = realPodName.Split('-');
         _prefix = parts.Length >= 3 ? string.Join('-', parts[..^1]) : "transactions-api-local";
-        _names = Enumerable.Range(0, Math.Max(1, count)).Select(_ => NewName()).ToArray();
+        // VIRTUAL_PODS=1 is the production-like setting: the pod label is this replica's own name.
+        _names = count <= 1 ? [realPodName] : Enumerable.Range(0, count).Select(_ => NewName()).ToArray();
         if (churnEvery > TimeSpan.Zero)
         {
             _churnTimer = new Timer(_ => Churn(), null, churnEvery, churnEvery);
@@ -332,6 +335,11 @@ sealed class VirtualPods
 sealed class TransactionMetrics
 {
     public const string MeterName = "Transactions.Api";
+    // Histogram buckets (seconds), shaped around where this app's latencies and percentiles actually are
+    // (p50 ≈ 35 ms, p95 ≈ 63 ms): fine resolution from 25 to 100 ms, then coarse out to the 3 s timeout.
+    // The earlier [5, 10, 25, 50, 100, 250 ms, …] put p95 and p99 inside one 50–100 ms bucket and
+    // overstated p95 by ~40% (89 vs 63 ms). Same bucket count as before (11 boundaries).
+    public static readonly double[] DurationBoundaries = [0.01, 0.025, 0.04, 0.05, 0.06, 0.07, 0.08, 0.1, 0.25, 1, 3];
     public const string TransactionsName = "http.transactions";
     public const string DurationName = "http.transaction.duration";
 
@@ -339,11 +347,13 @@ sealed class TransactionMetrics
     private readonly VirtualPods _pods;
     private readonly Counter<long> _transactions;
     private readonly Histogram<double> _duration;
+    private readonly KeyValuePair<string, object?>[] _appended;
 
-    public TransactionMetrics(IMeterFactory meterFactory, LabelSet labels, VirtualPods pods, ExportStats export)
+    public TransactionMetrics(IMeterFactory meterFactory, LabelSet labels, VirtualPods pods, ExportStats export, IConfiguration cfg)
     {
         _labels = labels;
         _pods = pods;
+        _appended = AppendedLabels.For(cfg["POD_NAME"] ?? Environment.MachineName, cfg.GetValue("APPENDED_LABELS", 0));
         var meter = meterFactory.Create(MeterName);
         // -> http_transactions_total, http_transaction_duration_seconds_*, transactions_cardinality_unbounded
         _transactions = meter.CreateCounter<long>(TransactionsName, description: "HTTP transactions processed");
@@ -370,8 +380,9 @@ sealed class TransactionMetrics
     public void Record(string consumeType, string state, string product, TimeSpan elapsed)
     {
         // Response time as a proper value: bounded histogram (pod comes from the resource/instance).
-        _duration.Record(elapsed.TotalSeconds,
-            new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } });
+        var durationTags = new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } };
+        foreach (var a in _appended) durationTags.Add(a);
+        _duration.Record(elapsed.TotalSeconds, durationTags);
 
         var (enabled, rtDecimals, extra, pools) = _labels.Current();
         bool Has(string l) => Array.IndexOf(enabled, l) >= 0;
@@ -380,6 +391,7 @@ sealed class TransactionMetrics
         if (Has("state")) tags.Add("state", state);
         if (Has("product")) tags.Add("product", product);
         if (Has("pod")) tags.Add("pod", _pods.Pick());
+        foreach (var a in _appended) tags.Add(a);
         // THE BUG: response time as a float LABEL. At 6 decimals nearly every request creates a new series;
         // lowering the precision buckets it (3 dp ≈ 1ms buckets, 2 dp ≈ 10ms, 1 dp ≈ 100ms). Band (-1) uses
         // 5 fixed latency bands instead: bounded no matter how latency spreads under load.
@@ -406,6 +418,9 @@ sealed class ExportStats(int intervalMs, int timeoutMs)
     private double _lastExportMs, _maxExportMsSinceRead;
     private long _lastPoints, _lastBytes, _lastSuccessUnixMs;
     private int _attemptsThisExport;
+    // Why exports failed: per failed HTTP attempt "HTTP <code>", "timeout / cancelled" or "connection: <error>",
+    // and per export that failed without any HTTP request (e.g. the exporter gave up before sending).
+    private readonly Dictionary<string, long> _failureReasons = [];
 
     public int IntervalMs => intervalMs;
     public int TimeoutMs => timeoutMs;
@@ -423,7 +438,8 @@ sealed class ExportStats(int intervalMs, int timeoutMs)
         {
             _exports++;
             if (!ok) _failures++;
-            else _lastSuccessUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (!ok && Volatile.Read(ref _attemptsThisExport) == 0) Count(NotSent);
+            if (ok) _lastSuccessUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _lastExportMs = elapsed.TotalMilliseconds;
             _maxExportMsSinceRead = Math.Max(_maxExportMsSinceRead, _lastExportMs);
             _totalExportMicros += (long)(elapsed.TotalMilliseconds * 1000);
@@ -431,12 +447,18 @@ sealed class ExportStats(int intervalMs, int timeoutMs)
         }
     }
 
-    public void OnHttpAttempt(long bytes, bool ok)
+    public const string NotSent = "not sent (export failed before any HTTP request)";
+
+    private void Count(string reason) => _failureReasons[reason] = _failureReasons.GetValueOrDefault(reason) + 1;
+
+    public Dictionary<string, long> FailureReasons() { lock (_lock) return new(_failureReasons); }
+
+    public void OnHttpAttempt(long bytes, bool ok, string? failure = null)
     {
         lock (_lock)
         {
             _httpRequests++;
-            if (!ok) _httpFailures++;
+            if (!ok) { _httpFailures++; Count(failure ?? "failed"); }
             if (Interlocked.Increment(ref _attemptsThisExport) > 1) _httpRetries++;
             if (bytes > 0) _lastBytes = bytes;
         }
@@ -495,18 +517,28 @@ sealed class MeasuredExporter(BaseExporter<Metric> inner, ExportStats stats) : B
 
 sealed class ExportHttpHandler(ExportStats stats) : DelegatingHandler
 {
+    // Records each attempt's outcome: a status code means the request reached the agent (and how it answered);
+    // an exception means it did not complete (timeout, connection refused/reset, ...).
+    private static string Reason(HttpResponseMessage r) => $"HTTP {(int)r.StatusCode}";
+    private static string Reason(Exception e) => e switch
+    {
+        TaskCanceledException or OperationCanceledException => "timeout / cancelled",
+        HttpRequestException h => $"connection: {h.HttpRequestError}",
+        _ => e.GetType().Name,
+    };
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
         var bytes = request.Content?.Headers.ContentLength ?? 0;
         try
         {
             var resp = await base.SendAsync(request, ct);
-            stats.OnHttpAttempt(bytes, resp.IsSuccessStatusCode);
+            stats.OnHttpAttempt(bytes, resp.IsSuccessStatusCode, resp.IsSuccessStatusCode ? null : Reason(resp));
             return resp;
         }
-        catch
+        catch (Exception e)
         {
-            stats.OnHttpAttempt(bytes, false);
+            stats.OnHttpAttempt(bytes, false, Reason(e));
             throw;
         }
     }
@@ -517,14 +549,43 @@ sealed class ExportHttpHandler(ExportStats stats) : DelegatingHandler
         try
         {
             var resp = base.Send(request, ct);
-            stats.OnHttpAttempt(bytes, resp.IsSuccessStatusCode);
+            stats.OnHttpAttempt(bytes, resp.IsSuccessStatusCode, resp.IsSuccessStatusCode ? null : Reason(resp));
             return resp;
         }
-        catch
+        catch (Exception e)
         {
-            stats.OnHttpAttempt(bytes, false);
+            stats.OnHttpAttempt(bytes, false, Reason(e));
             throw;
         }
+    }
+}
+
+// Identity labels an observability team might append to every series (Kubernetes attributes promoted to
+// metric labels). One value per pod, so they don't multiply the series count; they make every series
+// heavier, and some (pod uid, container id) change on every restart.
+static class AppendedLabels
+{
+    public static readonly string[] Names =
+        ["k8s_namespace_name", "k8s_node_name", "k8s_replicaset_name", "k8s_pod_uid", "container_id", "k8s_pod_ip", "cluster", "region"];
+
+    public static KeyValuePair<string, object?>[] For(string podName, int count)
+    {
+        var n = Math.Clamp(count, 0, Names.Length);
+        if (n == 0) return [];
+        var parts = podName.Split('-');
+        var replicaSet = parts.Length >= 3 ? string.Join('-', parts[..^1]) : podName;
+        var values = new[]
+        {
+            "demo",
+            $"aks-nodepool1-{Random.Shared.Next(10_000_000, 99_999_999)}-vmss{Random.Shared.Next(0, 20):D6}",
+            replicaSet,
+            Guid.NewGuid().ToString(),
+            "containerd://" + Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)).ToLowerInvariant(),
+            $"10.244.{Random.Shared.Next(0, 255)}.{Random.Shared.Next(2, 254)}",
+            "cluster-a",
+            "eastus",
+        };
+        return Names.Take(n).Select((name, i) => new KeyValuePair<string, object?>(name, values[i])).ToArray();
     }
 }
 
@@ -597,6 +658,8 @@ sealed class ReplicaStats(LabelSet labels, VirtualPods pods, ExportStats export,
             ExportHttpFailures = ex.HttpFailures,
             ExportHttpRetries = ex.HttpRetries,
             ExportLastSuccessUnixMs = ex.LastSuccessUnixMs,
+            ExportFailureReasons = export.FailureReasons(),
+            AppendedLabels = Math.Clamp(cfg.GetValue("APPENDED_LABELS", 0), 0, AppendedLabels.Names.Length),
         };
     }
 
@@ -676,4 +739,6 @@ sealed class ReplicaSnapshot
     public long ExportHttpFailures { get; set; }
     public long ExportHttpRetries { get; set; }
     public long ExportLastSuccessUnixMs { get; set; }
+    public Dictionary<string, long> ExportFailureReasons { get; set; } = [];
+    public int AppendedLabels { get; set; }
 }

@@ -10,6 +10,8 @@ A local reproduction of a production incident. A .NET service records each HTTP 
  k6 ──remote_write (its own latency, bypasses Alloy)──────────────────────────────────────────────────▶ Prometheus
 ```
 
+> **Status (2026-11-15):** results are in [docs/experiment-log.md](docs/experiment-log.md), with pick-up notes in [docs/next-steps.md](docs/next-steps.md) and the fix plan in [docs/proving-the-fix.md](docs/proving-the-fix.md). The production service turned out to **already bucket response time**. So the float label here is a reproduction device, not the production cause, and the suspects are now the `pod` and appended labels and the SDK cardinality limit. See the [300-pod fleet](#pod-label-test-a-300-pod-simulated-fleet) below. An [independent review](docs/review-2026-11-15.md) corrected several claims: in this repo, the app's cost comes from the SDK's own state, not from agent back pressure.
+
 All components are free and open source: k3d/k3s, kube-prometheus-stack 93.3.0, Grafana Alloy v1.21.3 (chart 1.15.0), OpenTelemetry .NET 1.21, k6 1.8.3.
 
 ## Cluster and node pools
@@ -118,7 +120,9 @@ Run the bug test under both Prometheus profiles. `profile-oom` shows the pipelin
 | Command | Alloy | Effect |
 |---|---|---|
 | `make agent-normal PROTECT_PROM=1` | 1Gi, no CPU limit, no memory_limiter | Usually keeps up (it can still OOM on very large payloads) |
-| `make agent-constrained PROTECT_PROM=1` | 250m CPU / 384Mi + memory_limiter (70%) | Slows down and refuses data with HTTP 503. The app retries, holding payloads in memory (`OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=in_memory`). |
+| `make agent-constrained PROTECT_PROM=1` | 250m CPU / 384Mi + memory_limiter (70%) | Slows down and refuses data with HTTP 503, then OOMs. Intended to make the app retry (`OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=in_memory`). In the L4/L5 runs it was crash-looping or idle when the app stalled, so treat it as "an undersized agent" (see the review). |
+
+Each report records **why exports failed**: `HTTP <code>`, `timeout / cancelled`, `connection: …`, or "not sent". It shows throttling both as the most-throttled pod and as the mean across pods, and p95 both as a mean and as a median.
 
 ### Hypothesis tests panel (one click per run)
 
@@ -163,11 +167,27 @@ Then it waits for all three to be ready, applies the labels, waits one export cy
 
 **Cardinality limit scope:** `OTEL_CARDINALITY_LIMIT_SCOPE=transactions` (the default) applies the 200k limit only to `http_transactions_total`. With `all`, the SDK pre-allocates storage for every instrument: about 560 MiB, or 97% of the GC heap limit. The app then dies of `OutOfMemoryException` before any back pressure can build. That's a separate finding.
 
+## Pod-label test: a 300-pod simulated fleet
+
+Production pods each stamp only their **own** pod name, so no single pod sends much. This test checks whether the *aggregate* overwhelms the agent and affects the live app.
+
+```sh
+make fleet-node      # once: tainted node pool=fleet (1.75 GB, 2 CPUs) for the simulated pods
+make prod-pods       # real replicas: own pod name only (VIRTUAL_PODS=1); make lab-pods restores 50
+make fleet-on        # 2 x 150 = 300 simulated pods (APP_ROLE=fleet, app/Fleet.cs); make fleet-off stops them
+make appended-labels N=4   # optional: 0-8 identity labels (k8s node, pod uid, container id, ...) on every series
+```
+
+- **Per simulated pod:** its own OTel MeterProvider, resource and OTLP export every 10s, at its own phase.
+- **Labels:** production-style (own `pod`, `response_time` as 5 bands), plus 100 extra series for the pod's other metrics. Knobs are in `k8s/fleet.yaml`: `FLEET_PODS`, `FLEET_RATE_PER_POD`, `FLEET_RESPONSE_TIME`, `FLEET_EXTRA_SERIES`, `FLEET_CHURN_SECONDS` and `FLEET_APPENDED_LABELS`.
+- **Prometheus:** the `PROTECT_PROM` configs drop fleet series before Prometheus. Alloy still receives and converts them.
+- **Control matching:** a fleet run's report compares against the same labels without the fleet.
+
 ## Finding the way back: step labels down
 
 Once the failure reproduces, use the label controls in the console to reduce cardinality one step at a time. Re-run the same ramp after each step and compare in Run history:
 
-1. `response_time` precision 6 dp → 3 dp (≈1ms buckets) → 2 dp (≈10ms) → 1 dp (≈100ms) → off. The right fix is the `http_transaction_duration_seconds` histogram, which is already recorded.
+1. `response_time` precision 6 dp → 3 dp (≈1ms buckets) → 2 dp (≈10ms) → 1 dp (≈100ms) → **band** (5 fixed values) → off. The right fix is the `http_transaction_duration_seconds` histogram, which is already recorded. Its buckets are shaped around this app's latencies (10–100 ms in 10–15 ms steps).
 2. Then `pod` (about 200 values): drop it, or rely on the resource's `instance`.
 3. Then `product`, `state`, `consume_type`, if needed.
 
@@ -208,7 +228,7 @@ Undo with `make unfix-app` / `make uncap-app` / `make calm` / `make unchurn` / `
 ## Files
 
 ```
-app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs + wwwroot/ (load-test console), Report.cs (run reports)
+app/                         .NET 10 image: Api.cs (transactions-api), Driver.cs + wwwroot/ (load-test console), Report.cs (run reports), Fleet.cs (simulated pods)
 agent/config.alloy           Alloy pipeline, unguarded (production-like)
 agent/config-guarded.alloy   Alloy pipeline with memory_limiter + relabel drop
 agent/config-constrained.alloy + values-constrained.yaml   "constrained" agent profile (back pressure)
@@ -219,7 +239,9 @@ monitoring/values.yaml       kube-prometheus-stack: 1Gi Prometheus limit, remote
 monitoring/values-starvation.yaml  overlay: Prometheus unlimited, on the app pool (noisy neighbour)
 monitoring/dashboards/       Grafana dashboards: "Cardinality Repro" (overview), "Cardinality Deep Dive" (5 sections: flow, cardinality, Prometheus, app, Alloy)
 k8s/app.yaml                 transactions-api (4 replicas, app pool), headless Service, transactions-driver
+k8s/fleet.yaml               transactions-fleet: simulated pods on the fleet node (make fleet-on)
 k8s/load-k6.yaml             k6 script + Job (remote-writes its latency to Prometheus)
+docs/                        experiment-log.md (results), next-steps.md (pick-up notes), proving-the-fix.md, review-2026-11-15.md
 ```
 
 ## Cleanup

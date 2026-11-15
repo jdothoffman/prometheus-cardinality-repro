@@ -1,10 +1,17 @@
 # Proving the fix: response-time metrics that scale
 
-**Status:** a candidate fix and the plan to test it. Run this *after* the hypothesis is shown reliably (see [next-steps.md](next-steps.md), decision 3). The results so far are in [experiment-log.md](experiment-log.md).
+**Status:** fix runs F1 (SDK allow-list View) and F5 (latency band) passed at L5. The results are in [experiment-log.md](experiment-log.md), and they were checked in [review-2026-11-15.md](review-2026-11-15.md).
 
-## The problem in one line
+> **Production pivot (2026-11-15).** Production **already buckets response time**, so the float label below is not the production cause. It is still the clearest way to reproduce high-cardinality damage, and the fixes here (histograms, allow-list Views, cardinality budgets) apply to any label. For production the remaining suspects are:
+> - the `pod` label and the labels the observability team appends
+> - a raised `CardinalityLimit` across many instruments (run A in the experiment log)
+> - the aggregate of many pods overwhelming the agent (the 300-pod fleet test)
+>
+> The guardrails in section 4 and fix F1 address all three.
 
-`response_time` as a float label makes nearly every request a new time series. At 6 decimal places it behaves like a request ID. Pipeline cost then grows with **request volume** instead of staying fixed.
+## The problem in one line (the repro's bug)
+
+`response_time` as a float label makes nearly every request a new time series. At 6 decimal places it behaves like a request ID. Pipeline cost then grows with **request volume** instead of staying fixed. **In this repo, the cost to the app is the SDK's own state** (about 200k series and a 480 MiB heap per pod), more than any back pressure from the agent.
 
 ## How precision multiplies series
 
@@ -66,9 +73,9 @@ In .NET, choose the buckets and an allow-list of labels in one View. The SDK is 
 - **Label values must come from a small, known set.** Product, state, region and route template are fine. IDs, raw numbers, full URLs and timestamps are never fine.
 - **Do the math before adding a label.** The production shape:
   - 4 × 4 × 10 = 160 combinations
-  - × about 12 series per histogram (10 buckets + sum + count)
-  - ≈ 2,000 series per pod
-  - × 150 pods ≈ 290k series
+  - × 13 series per histogram (10 boundaries = 11 buckets, plus sum and count)
+  - ≈ 2,100 series per pod
+  - × 150 pods ≈ 310k series
   
   That's manageable. Exponential histograms bring it to about 24k. A 6-dp `response_time` label is unbounded.
 - **Per-pod latency is rarely needed.** Keep pod identity on a few health metrics, and aggregate it away on latency histograms, either in the SDK or with Prometheus recording rules.
@@ -119,15 +126,36 @@ Each run is the hypothesis preset at that level, plus a fix knob. All knobs alre
 
 Compare against the hypothesis run at the same level and against its control. The fix passes when all of these hold:
 
-| Signal | Hypothesis (L5, today) | Fixed means |
-|---|---|---|
-| Export payload per replica | 67 MB, 200k points | at control level, ≈1.2 MB / 8k points |
-| Export failures / retries | 452 / 45 | 0 / 0 |
-| Alloy | OOMKilled 5×, refusing 11k points/s | no restarts, 0 refused |
-| App .NET heap (peak) | 482 MiB of 576 MiB | at control level, ≈40 MiB |
-| Pod throttling, late quarter | 42% | within a few points of control (33%) |
-| p95, late quarter | 87 ms | within a few ms of control (63 ms) |
-| Stalls / client errors | p95 1,340 ms stall, 0 errors | none |
+| Signal | Hypothesis (L5, 3 runs) | Fixed means | **F1 result** |
+|---|---|---|---|
+| Export payload per replica | 66–67 MB, 200k points | at control level, ≈1.2 MB / 8k points | ✅ 1.2 MB / 8.2k |
+| Export failures / retries | 452–455 / 45–68 | 0 / 0 | ✅ 0 / 0 |
+| Alloy | refusing 10.6–11.2k points/s early, OOMKilled 5–6× (Kubernetes `restartCount`), then idle | no restarts, 0 refused | ✅ healthy |
+| App .NET heap (peak) | 477–482 MiB of 576 MiB | at control level, ≈40 MiB | ✅ 41 MiB |
+| Pod throttling, **mean across pods**, t=1030–1200 | 14.7–18.4% | within a few points of control (9.4%) | ✅ 9.6% |
+| Pod throttling, worst pod, late quarter (report statistic) | 42–51% | within a few points of control (33%) | ✅ 31% |
+| p95, late quarter, **median** of per-second p95 | 63.6–63.7 ms | within about 1 ms of control (62.6 ms) | ✅ 62.8 ms |
+| Stalls / client errors | 2 stalls from t=973 (worst p95 1,340 ms), 0 errors | none | ✅ none |
+
+The steady-state CPU and latency differences being fixed are small (review 3.1–3.2). The clear signals F1 removes are the **SDK state** (heap, export size and failures), the **agent damage**, and the **stalls**.
+
+**F5 passed** (run `20261115-134526`):
+
+- **What the app added:** `response_time` as 5 fixed bands, with no GUID labels.
+- **Export:** 15.8k points / 2.8 MB, about 2× control, because only the `0-50ms` and `50-250ms` bands occur at normal latency. There were 0 export failures, and Alloy was healthy with brief refusals of up to 882 points/s.
+- **App:** heap 49 MiB, throttling 30 → 21%, p95 63 ms, 0 client failures.
+- **Caveat:** `PROTECT_PROM` drops any series with a `response_time` label, so the Prometheus cost of the band series wasn't measured here. By the arithmetic it's about 2× the bounded series, and at most 5× under heavy degradation.
+
+**F1 passed on every signal** (run `20261115-132242`, 2026-11-15). The code still added `response_time`(6dp) and 5 unique GUID labels; the SDK View (`OTEL_ALLOWED_TAGS=consume_type,state,product,pod`) dropped them before export.
+
+### Histogram accuracy: buckets matter
+
+In F1, the server-side histogram's p95 read **89 ms**, while the true client-side p95 was **63 ms** (p50: 34 ms against 37 ms, which is fine). The current boundaries are `5, 10, 25, 50, 100, 250 ms…`. 22% of requests sit in the single 50–100 ms bucket, and interpolation inside it overestimates p95 and p99.
+
+- **Lesson:** a histogram keeps the latency signal at fixed cost, but **place the boundaries where your percentiles and SLOs are**. For example: `25, 50, 60, 75, 100, 150, 250, 500 ms, 1, 2.5, 5 s`.
+- **Alternative:** use exponential histograms, which adapt their resolution automatically.
+- **Stability:** the histogram was rock-steady (88.3–88.8 ms all run), so even coarse buckets work for trends and alerting. They're just imprecise in absolute terms.
+- **Suggested follow-up:** re-run F1 with SLO-shaped buckets and check that the p95 lands within a few ms of the driver's.
 
 For F3, record each step's numbers. The first precision at which every signal is at control level is the "safe" setting, and the answer to "which labels can we keep?"
 

@@ -1,0 +1,65 @@
+# Simulated fleet: FLEET_REPLICAS (make var, default 2) x FLEET_PODS (150) = 300 simulated pods.
+# Each simulated pod has its own OTel SDK pipeline and pushes its own OTLP export to Alloy, with
+# production-style labels (own pod name, bucketed response_time). See app/Fleet.cs.
+# Runs on the tainted "fleet" node (make fleet-node) so it never competes with the replicas under test.
+# Start/stop with `make fleet-on` / `make fleet-off`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transactions-fleet
+  namespace: demo
+  labels: { app: transactions-fleet }
+spec:
+  replicas: 0 # set by make fleet-on (FLEET_REPLICAS)
+  selector:
+    matchLabels: { app: transactions-fleet }
+  template:
+    metadata:
+      labels: { app: transactions-fleet }
+    spec:
+      nodeSelector:
+        pool: fleet
+      tolerations:
+        - { key: pool, operator: Equal, value: fleet, effect: NoSchedule }
+      containers:
+        - name: fleet
+          image: transactions-api:local
+          imagePullPolicy: Never
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: APP_ROLE, value: fleet }
+            - { name: FLEET_PODS, value: "150" }
+            - { name: FLEET_RATE_PER_POD, value: "6" }
+            # band = 5 fixed latency buckets (production already buckets response time); off | 0-6 decimals.
+            - { name: FLEET_RESPONSE_TIME, value: band }
+            # Stand-in for the other metrics (runtime, HTTP server/client, dependency calls) each pod exports.
+            - { name: FLEET_EXTRA_SERIES, value: "100" }
+            - { name: FLEET_CHURN_SECONDS, value: "0" }
+            # 0-8 identity labels on every series (k8s node, pod uid, container id, ...). make appended-labels N=...
+            - { name: FLEET_APPENDED_LABELS, value: "0" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://alloy.alloy.svc.cluster.local:4318" }
+            - { name: OTEL_METRIC_EXPORT_INTERVAL, value: "10000" }
+            - { name: OTEL_METRIC_EXPORT_TIMEOUT, value: "8000" }
+            - { name: OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY, value: in_memory }
+            - { name: DOTNET_gcServer, value: "0" }
+            - { name: Logging__LogLevel__Microsoft.AspNetCore, value: Warning }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: "1", memory: 768Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+---
+# Headless Service: the driver reads each fleet replica's /admin/stats (pod count, export failures).
+apiVersion: v1
+kind: Service
+metadata:
+  name: transactions-fleet-headless
+  namespace: demo
+  labels: { app: transactions-fleet }
+spec:
+  clusterIP: None
+  selector: { app: transactions-fleet }
+  ports:
+    - { name: http, port: 8080, targetPort: http }

@@ -14,10 +14,16 @@ PROM_POD       := prometheus-kps-prometheus-0
 APP            := deploy/transactions-api
 DRIVER         := deploy/transactions-driver
 APP_NODES      := k3d-$(CLUSTER)-agent-0 k3d-$(CLUSTER)-agent-1
+FLEET          := deploy/transactions-fleet
+FLEET_REPLICAS ?= 2
+FLEET_NODE_MEM ?= 1792m
+FLEET_NODE_CPUS ?= 2
+N              ?= 0
 
 .PHONY: help prereqs up monitoring agent app all ui load load-stop load-logs explode calm churn \
         unchurn reset-prometheus agent-down agent-up guard-agent unguard-agent fix-app unfix-app \
-        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports agent-normal agent-constrained
+        cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports agent-normal agent-constrained \
+        fleet-node fleet-on fleet-off prod-pods lab-pods appended-labels
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -74,6 +80,7 @@ app: ## Build the .NET image, import into k3d, deploy the api replicas + the loa
 	k3d image import $(IMAGE) -c $(CLUSTER)
 	$(K) apply -f k8s/app.yaml
 	$(K) -n demo rollout restart $(APP) $(DRIVER)
+	-@$(K) -n demo rollout restart $(FLEET) 2>/dev/null || true
 	$(K) -n demo rollout status $(APP) --timeout=180s
 	$(K) -n demo rollout status $(DRIVER) --timeout=120s
 
@@ -106,6 +113,35 @@ load-logs: ## Show k6 output
 
 explode: ## THE BUG: add response_time (float) as a label
 	$(K) -n demo set env $(APP) CARDINALITY_MODE=unbounded
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+fleet-node: ## Add the tainted "fleet" node for simulated pods (once per cluster; 1.75 GB, 2 CPUs)
+	k3d node create fleetpool -c $(CLUSTER) --role agent --memory $(FLEET_NODE_MEM) --k3s-node-label pool=fleet
+	$(K) wait --for=condition=Ready nodes --all --timeout=180s
+	# Taint via the API: passing --node-taint to k3d node create can duplicate it and crash-loop the kubelet.
+	$(K) taint nodes k3d-fleetpool-0 pool=fleet:NoSchedule --overwrite
+	docker update --cpus $(FLEET_NODE_CPUS) k3d-fleetpool-0 >/dev/null
+
+fleet-on: ## Start the simulated fleet: FLEET_REPLICAS x 150 = 300 pods, each pushing its own OTLP export to Alloy
+	$(K) apply -f k8s/fleet.yaml
+	$(K) -n demo scale $(FLEET) --replicas=$(FLEET_REPLICAS)
+	$(K) -n demo rollout restart $(FLEET)
+	$(K) -n demo rollout status $(FLEET) --timeout=180s
+
+fleet-off: ## Stop the simulated fleet
+	-$(K) -n demo scale $(FLEET) --replicas=0
+
+prod-pods: ## Production-like pod label: each real replica stamps only its own pod name (VIRTUAL_PODS=1)
+	$(K) -n demo set env $(APP) VIRTUAL_PODS=1
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+appended-labels: ## Append N (0-8) identity labels (k8s node, pod uid, container id, ...) to every series, real replicas + fleet: N=4
+	$(K) -n demo set env $(APP) APPENDED_LABELS=$(N)
+	-$(K) -n demo set env $(FLEET) FLEET_APPENDED_LABELS=$(N) 2>/dev/null
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+lab-pods: ## Back to 50 simulated pod names per real replica (the L1-L5 setting)
+	$(K) -n demo set env $(APP) VIRTUAL_PODS=50
 	$(K) -n demo rollout status $(APP) --timeout=180s
 
 calm: ## Remove the response_time label
