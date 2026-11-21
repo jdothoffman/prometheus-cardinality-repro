@@ -241,6 +241,19 @@ make appended-labels N=4   # optional: identity labels on every series (real rep
 
 A fleet run's report finds its control automatically: the same labels, with no fleet. The pass/fail criteria for the first P300 pair are in the experiment log, section 4b.
 
+### 9. Cardinality-limit sweep (run A)
+
+Bounded labels, `VIRTUAL_PODS=1`, the limit applied to every instrument at several values, a 10-minute soak each:
+
+```sh
+make prod-pods
+kubectl --context k3d-cardinality -n demo set env deploy/transactions-api \
+  OTEL_CARDINALITY_LIMIT=<n> OTEL_CARDINALITY_LIMIT_SCOPE=all
+# then a prepared run (Reset everything + soak); the restarted pods keep the env
+```
+
+Measures the heap the SDK reserves against the 576 MiB GC limit, and whether the app survives load. Read the heap under load: with no traffic, `/admin/stats` shows the heap as of the last GC, which can predate the SDK's allocation. Restore with `OTEL_CARDINALITY_LIMIT=200000 OTEL_CARDINALITY_LIMIT_SCOPE=transactions`. Criteria and results: experiment log, section 4c.
+
 ### Reports
 
 After each console run, the driver waits ~25s, collects evidence (terminations, events, crash logs, PromQL charts), and writes a self-contained HTML report.
@@ -256,6 +269,12 @@ Copy reports locally with:
 
 ```sh
 make reports   # → ./reports/ (gitignored)
+```
+
+Print the statistics the experiment log quotes (windowed mean throttling across pods, median p95, stalls, export failure reasons; `--minutes` adds a per-minute export timeline):
+
+```sh
+python3 tools/report-stats.py reports/<run>.html [--windows 420-960,1030-1200] [--minutes]
 ```
 
 ## Config file map

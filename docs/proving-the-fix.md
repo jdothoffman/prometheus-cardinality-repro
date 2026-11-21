@@ -91,6 +91,7 @@ These turn one bad label into a dashboard problem instead of an outage.
 
 - **SDK:**
   - Keep `CardinalityLimit` low. The default of 2,000 is a protection: overflow goes to `otel_metric_overflow` instead of exploding. Production has almost certainly raised it; check.
+  - Raise it per instrument, never globally. The SDK allocates `limit + 2` metric points for every stream the limit applies to, at once, whatever the series count: about 4 KiB of heap per unit of limit across this app's streams. 200k on every instrument took the app down with bounded labels; 100k left 32% of the GC heap (experiment log, section 4c). Budget *limit × streams × about 130 bytes* against 75% of the pod memory limit.
   - Use the allow-list View from section 1.
   - Know the OTLP exporter's request limit: `OtlpExporterOptions.MaxRequestSizeBytes` is 64 MiB from exporter 1.18 on, and a larger export is dropped whole, silently, runtime metrics included. Keep each pod's export far below it, and alert on pods whose series go stale while the pod is alive.
 - **Agent:**
