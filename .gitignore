@@ -10,3 +10,6 @@ obj/
 *.swp
 # Load-test reports copied from the driver (make reports)
 reports/
+# Private Azure lab details (subscription, public IP) — public repo; keep local only
+docs/azure-telemetry-lab.md
+.lab.env
