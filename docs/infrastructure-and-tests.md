@@ -2,6 +2,8 @@
 
 Exact stack, layout, and test procedures for this cardinality repro. For the incident narrative and how to interpret results, see the [README](../README.md).
 
+Azure VM lab (public template): [azure-telemetry-lab.example.md](azure-telemetry-lab.example.md). Private IPs/subscription go in gitignored `azure-telemetry-lab.md` / `.lab.env`.
+
 ## Pipeline
 
 ```
