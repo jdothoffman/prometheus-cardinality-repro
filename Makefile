@@ -19,11 +19,12 @@ FLEET_REPLICAS ?= 2
 FLEET_NODE_MEM ?= 1792m
 FLEET_NODE_CPUS ?= 2
 N              ?= 0
+RATIO          ?= 0.1
 
 .PHONY: help prereqs up monitoring agent app all ui load load-stop load-logs explode calm churn \
         unchurn reset-prometheus agent-down agent-up guard-agent unguard-agent fix-app unfix-app \
         cap-app uncap-app status watch down node-cpus profile-starvation profile-oom reports agent-normal agent-constrained \
-        fleet-node fleet-on fleet-off prod-pods lab-pods appended-labels
+        fleet-node fleet-on fleet-off prod-pods lab-pods appended-labels tracing traces-on traces-off exemplars-off
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -84,7 +85,7 @@ app: ## Build the .NET image, import into k3d, deploy the api replicas + the loa
 	$(K) -n demo rollout status $(APP) --timeout=180s
 	$(K) -n demo rollout status $(DRIVER) --timeout=120s
 
-all: up monitoring agent app ## up + monitoring + agent + app
+all: up monitoring agent tracing app ## up + monitoring + agent + tracing (Tempo) + app
 
 ui: ## Port-forward the load-test console :8080, Grafana :3000, Prometheus :9090 (Ctrl-C to stop)
 	@echo "Load test  http://localhost:8080  <- Start button"
@@ -92,7 +93,7 @@ ui: ## Port-forward the load-test console :8080, Grafana :3000, Prometheus :9090
 	@echo "Prometheus http://localhost:9090"
 	@trap 'kill 0' INT TERM; \
 	  while true; do $(K) -n demo port-forward svc/transactions-driver 8080:8080; sleep 2; done & \
-	  $(K) -n monitoring port-forward svc/kps-grafana 3000:80 & \
+	  while true; do $(K) -n monitoring port-forward svc/kps-grafana 3000:80; sleep 2; done & \
 	  while true; do $(K) -n monitoring port-forward svc/kps-prometheus 9090:9090; sleep 3; done & \
 	  wait
 
@@ -142,6 +143,25 @@ appended-labels: ## Append N (0-8) identity labels (k8s node, pod uid, container
 
 lab-pods: ## Back to 50 simulated pod names per real replica (the L1-L5 setting)
 	$(K) -n demo set env $(APP) VIRTUAL_PODS=50
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+tracing: ## Install Tempo (namespace tracing) and roll it if its config changed. Grafana's side comes with `make monitoring`
+	$(K) apply -f k8s/tempo.yaml
+	$(K) -n tracing patch deploy/tempo -p '{"spec":{"template":{"metadata":{"annotations":{"tempo/config-rev":"'$$(shasum k8s/tempo.yaml | cut -c1-12)'"}}}}}'
+	$(K) -n tracing rollout status deploy/tempo --timeout=180s
+
+traces-on: ## Trace RATIO (default 0.1, max 0.75) of transactions, with exemplars; change it live in the console
+	@awk 'BEGIN { exit !("$(RATIO)" + 0 >= 0 && "$(RATIO)" + 0 <= 0.75 && "$(RATIO)" ~ /^[0-9.]+$$/) }' || \
+	  { echo "RATIO=$(RATIO): trace sampling must be between 0 and 0.75 (capped at 75%)"; exit 1; }
+	$(K) -n demo set env $(APP) TRACING_ENABLED=true TRACE_SAMPLE_RATIO=$(RATIO) METRIC_EXEMPLARS=trace_based
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+exemplars-off: ## Keep tracing but attach no exemplars (to measure what exemplars cost)
+	$(K) -n demo set env $(APP) METRIC_EXEMPLARS=off
+	$(K) -n demo rollout status $(APP) --timeout=180s
+
+traces-off: ## No tracing pipeline at all, no exemplars: the setting of every experiment run before tracing
+	$(K) -n demo set env $(APP) TRACING_ENABLED=false TRACE_SAMPLE_RATIO=0
 	$(K) -n demo rollout status $(APP) --timeout=180s
 
 calm: ## Remove the response_time label

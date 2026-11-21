@@ -1,0 +1,155 @@
+# Grafana Tempo, single binary, local disk (emptyDir): the trace store for `make tracing`.
+#
+#   transactions-api --OTLP spans--> Alloy --OTLP/gRPC--> Tempo :4317
+#   Grafana --TraceQL / trace by id / TraceQL metrics--> Tempo :3200
+#
+# metrics-generator runs ONLY the local-blocks processor: it keeps recent spans in Tempo so TraceQL
+# metrics (rate, error rate, duration histograms over spans) can be computed at query time. That is
+# what the Traces Drilldown app (Grafana's "samples" view) uses. It does NOT write any series to
+# Prometheus: span-metrics and service-graphs processors are deliberately off, because those would
+# turn span attributes into Prometheus labels (see docs/tracing.md).
+#
+# Tempo 2.10 (the maintained 2.x line). Tempo 3.x replaces ingesters and local-blocks with a new
+# ingest architecture and a different config; migrate with `tempo-cli migrate config`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tracing
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo
+  namespace: tracing
+data:
+  tempo.yaml: |
+    stream_over_http_enabled: true
+    server:
+      http_listen_port: 3200
+      grpc_listen_port: 9095
+      log_level: info
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc: { endpoint: "0.0.0.0:4317" }
+            http: { endpoint: "0.0.0.0:4318" }
+    ingester:
+      max_block_duration: 5m
+    compactor:
+      compaction:
+        block_retention: 6h        # same as Prometheus (monitoring/values.yaml)
+    query_frontend:
+      search:
+        duration_slo: 5s
+      metrics:
+        max_duration: 6h
+    metrics_generator:
+      registry:
+        external_labels: { source: tempo }
+      storage:
+        path: /var/tempo/generator/wal
+        # no remote_write: nothing generated here reaches Prometheus
+      traces_storage:
+        path: /var/tempo/generator/traces
+      processor:
+        local_blocks:
+          filter_server_spans: false   # keep child spans too, so Drilldown can break down by any span
+          flush_to_storage: true       # TraceQL metrics beyond the in-memory window
+    storage:
+      trace:
+        backend: local
+        wal: { path: /var/tempo/wal }
+        local: { path: /var/tempo/blocks }
+    overrides:
+      defaults:
+        metrics_generator:
+          processors: [local-blocks]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: tracing
+  labels: { app: tempo }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: tempo }
+  template:
+    metadata:
+      labels: { app: tempo }
+      annotations:
+        # bump to roll Tempo after editing the ConfigMap: `make tracing` does this
+        tempo/config-rev: "1"
+    spec:
+      # Keep Tempo off the app pool (it would steal CPU from the pods under test) and off the agent pool.
+      # Prefer the fleet node when it exists (idle unless `make fleet-on`), else the control-plane node.
+      tolerations:
+        - { key: pool, operator: Equal, value: fleet, effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: pool, operator: NotIn, values: [agent] }
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - { key: pool, operator: In, values: [fleet] }
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - { key: pool, operator: NotIn, values: [app] }
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.10.10
+          args: ["-config.file=/etc/tempo/tempo.yaml"]
+          ports:
+            - { name: http, containerPort: 3200 }
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: otlp-http, containerPort: 4318 }
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 768Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/tempo }
+            - { name: data, mountPath: /var/tempo }
+      volumes:
+        - name: config
+          configMap: { name: tempo }
+        - name: data
+          emptyDir: { sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: tracing
+  labels: { app: tempo }
+spec:
+  selector: { app: tempo }
+  ports:
+    - { name: http, port: 3200, targetPort: http }
+    - { name: otlp-grpc, port: 4317, targetPort: otlp-grpc }
+    - { name: otlp-http, port: 4318, targetPort: otlp-http }
+---
+# Prometheus scrapes Tempo's own health (ingested spans, discarded spans, memory).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tempo
+  namespace: tracing
+spec:
+  selector:
+    matchLabels: { app: tempo }
+  endpoints:
+    - { port: http, interval: 30s }

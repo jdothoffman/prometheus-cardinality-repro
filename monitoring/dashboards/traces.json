@@ -1,0 +1,499 @@
+{
+  "uid": "trace-correlation",
+  "title": "Trace Correlation",
+  "tags": [
+    "traces",
+    "exemplars",
+    "repro"
+  ],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Repro Overview",
+      "type": "link",
+      "url": "/d/repro-overview",
+      "icon": "dashboard",
+      "keepTime": true
+    },
+    {
+      "title": "Traces Drilldown",
+      "type": "link",
+      "url": "/a/grafana-exploretraces-app/explore",
+      "icon": "external link"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "product",
+        "label": "Product",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "sort": 1,
+        "query": {
+          "qryType": 1,
+          "query": "label_values(http_transaction_duration_seconds_bucket, product)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "definition": "label_values(http_transaction_duration_seconds_bucket, product)"
+      },
+      {
+        "name": "consume_type",
+        "label": "Channel",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "sort": 1,
+        "query": {
+          "qryType": 1,
+          "query": "label_values(http_transaction_duration_seconds_bucket, consume_type)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "definition": "label_values(http_transaction_duration_seconds_bucket, consume_type)"
+      },
+      {
+        "name": "min_duration",
+        "label": "Min duration",
+        "type": "custom",
+        "query": "0ms,25ms,50ms,80ms,100ms,250ms,1s",
+        "current": {
+          "text": "50ms",
+          "value": "50ms"
+        },
+        "options": []
+      },
+      {
+        "name": "trace_id",
+        "label": "Trace ID",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Metrics: every diamond is one sampled request — hover it, then \"View trace\"",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 1
+    },
+    {
+      "type": "timeseries",
+      "title": "Response time p50 / p95 / p99 (with exemplars)",
+      "description": "From the bounded histogram http_transaction_duration_seconds. Exemplars are trace ids the OTel SDK kept for sampled requests, one per bucket per export; they are not labels, so they add no series.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 16,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(http_transaction_duration_seconds_bucket{product=~\"${product:regex}\", consume_type=~\"${consume_type:regex}\"}[1m])))",
+          "legendFormat": "p50",
+          "exemplar": false,
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_transaction_duration_seconds_bucket{product=~\"${product:regex}\", consume_type=~\"${consume_type:regex}\"}[1m])))",
+          "legendFormat": "p95",
+          "exemplar": true,
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_transaction_duration_seconds_bucket{product=~\"${product:regex}\", consume_type=~\"${consume_type:regex}\"}[1m])))",
+          "legendFormat": "p99",
+          "exemplar": false,
+          "range": true
+        }
+      ],
+      "id": 2
+    },
+    {
+      "type": "text",
+      "title": "How to drill in",
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 8,
+        "h": 9
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Metric → sample → trace**, like Application Insights' *Drill into samples*:\n\n1. **Diamonds** on the charts are exemplars: real sampled requests. Hover one and click **View trace**.\n2. **Samples** below lists sampled transactions slower than *min duration* (top bar) for the selected product/channel. Click a **Trace ID** to open its waterfall at the bottom of this page.\n3. In a trace, a span's **Related metrics** link goes back to p95 and throughput *for that product and channel*.\n4. For breakdowns and comparisons (*which attribute makes the slow requests slow?*), open [**Traces Drilldown**](/a/grafana-exploretraces-app/explore): select a duration range on its histogram, then **Comparison** / **Traces**.\n\nNeeds `make tracing` and `make traces-on`. Only *sampled* requests (`TRACE_SAMPLE_RATIO`) have traces; the metrics count every request."
+      },
+      "id": 3
+    },
+    {
+      "type": "heatmap",
+      "title": "Response-time distribution (buckets/s, with exemplars)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 9
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "unit": "s",
+          "axisPlacement": "left"
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Blues",
+          "steps": 64,
+          "exponent": 0.5,
+          "fill": "dark-blue",
+          "reverse": false
+        },
+        "cellGap": 1,
+        "exemplars": {
+          "color": "rgba(255,120,0,0.9)"
+        },
+        "tooltip": {
+          "mode": "single",
+          "yHistogram": true
+        },
+        "legend": {
+          "show": true
+        },
+        "filterValues": {
+          "le": 1e-09
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (le) (rate(http_transaction_duration_seconds_bucket{product=~\"${product:regex}\", consume_type=~\"${consume_type:regex}\"}[1m]))",
+          "legendFormat": "{{le}}",
+          "exemplar": true,
+          "range": true,
+          "format": "heatmap"
+        }
+      ],
+      "id": 4
+    },
+    {
+      "type": "timeseries",
+      "title": "Transactions / s by state (with exemplars)",
+      "description": "Exemplars on a counter: one recent sampled request per series. Failed transactions' traces carry an error status.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (state) (rate(http_transactions_total{consume_type=~\"${consume_type:regex}\", product=~\"${product:regex}\"}[1m]))",
+          "legendFormat": "{{state}}",
+          "exemplar": true,
+          "range": true
+        }
+      ],
+      "id": 5
+    },
+    {
+      "type": "row",
+      "title": "Samples: sampled transactions from Tempo (click a Trace ID)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 6
+    },
+    {
+      "type": "table",
+      "title": "Slow samples (duration ≥ min duration)",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 14,
+        "h": 10
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Show this trace below",
+                    "url": "/d/trace-correlation/trace-correlation?${__url_time_range}&${product:queryparam}&${consume_type:queryparam}&${min_duration:queryparam}&var-trace_id=${__value.raw}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Duration",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"transactions-api\" && kind=server && span.transaction.product=~\"${product:regex}\" && span.transaction.consume_type=~\"${consume_type:regex}\" && duration >= $min_duration} | select(span.transaction.state, span.transaction.product, span.transaction.consume_type, resource.service.instance.id)",
+          "limit": 50,
+          "tableType": "traces"
+        }
+      ],
+      "id": 7
+    },
+    {
+      "type": "table",
+      "title": "Failed samples",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 20,
+        "w": 10,
+        "h": 10
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Show this trace below",
+                    "url": "/d/trace-correlation/trace-correlation?${__url_time_range}&${product:queryparam}&${consume_type:queryparam}&${min_duration:queryparam}&var-trace_id=${__value.raw}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Duration",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"transactions-api\" && kind=server && span.transaction.product=~\"${product:regex}\" && span.transaction.consume_type=~\"${consume_type:regex}\" && status = error} | select(span.transaction.state, span.transaction.product, span.transaction.consume_type, resource.service.instance.id)",
+          "limit": 50,
+          "tableType": "traces"
+        }
+      ],
+      "id": 8
+    },
+    {
+      "type": "row",
+      "title": "Trace (end-to-end transaction)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 9
+    },
+    {
+      "type": "traces",
+      "title": "Trace ${trace_id}",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "${trace_id}"
+        }
+      ],
+      "id": 10
+    }
+  ]
+}

@@ -23,12 +23,57 @@ alertmanager:
 grafana:
   adminPassword: admin
   defaultDashboardsTimezone: browser
+  # Home page = "Repro Overview" (monitoring/dashboards/overview.json, written there by the dashboard sidecar).
+  grafana.ini:
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/overview.json
   sidecar:
     dashboards:
       enabled: true
       label: grafana_dashboard
       labelValue: "1"
       searchNamespace: ALL
+    datasources:
+      # METRIC -> TRACE: an exemplar's trace_id becomes a "View trace" link to Tempo on every
+      # Prometheus panel and in Explore (the diamonds on a latency graph). See docs/tracing.md.
+      exemplarTraceIdDestinations:
+        datasourceUid: tempo
+        traceIdLabelName: trace_id
+        urlDisplayLabel: View trace
+  # Tempo (k8s/tempo.yaml, `make tracing`). Until it's installed this datasource just fails its health check.
+  # In provisioning files Grafana expands $VARS from the environment, so Grafana's own $__tags is written $$__tags.
+  additionalDataSources:
+    - name: Tempo
+      uid: tempo
+      type: tempo
+      access: proxy
+      url: http://tempo.tracing.svc.cluster.local:3200
+      jsonData:
+        streamingEnabled: { search: true, metrics: true }
+        nodeGraph: { enabled: true }
+        search: { hide: false }
+        traceQuery:
+          timeShiftEnabled: true
+          spanStartTimeShift: -30m
+          spanEndTimeShift: 30m
+        # TRACE -> METRIC: from any span, open the metric slice it belongs to. Span attributes are mapped to
+        # the metric's labels (service.name -> job, as Alloy's Prometheus exporter does), so the link lands
+        # on e.g. p95 for "this product and channel", not on a per-trace series (there isn't one).
+        tracesToMetrics:
+          datasourceUid: prometheus
+          spanStartTimeShift: -15m
+          spanEndTimeShift: 15m
+          tags:
+            - { key: service.name, value: job }
+            - { key: transaction.product, value: product }
+            - { key: transaction.consume_type, value: consume_type }
+          queries:
+            - name: p95 response time (this product + channel)
+              query: histogram_quantile(0.95, sum by (le) (rate(http_transaction_duration_seconds_bucket{$$__tags}[1m])))
+            - name: Transactions / s by state (this product + channel)
+              query: sum by (state) (rate(http_transactions_total{$$__tags}[1m]))
+            - name: CPU throttling of every app pod (was the pod starved?)
+              query: sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{namespace="demo", container="app"}[1m])) / sum by (pod) (rate(container_cpu_cfs_periods_total{namespace="demo", container="app"}[1m]))
 
 prometheus:
   prometheusSpec:
@@ -38,6 +83,12 @@ prometheus:
     walCompression: true
     # App metrics arrive by push: Alloy (and k6) remote-write into Prometheus.
     enableRemoteWriteReceiver: true
+    # Exemplars (trace ids on samples, sent by Alloy) are kept in one in-memory ring buffer shared by all
+    # series: a fixed cost (~100k exemplars, a few tens of MiB at most), however many traces there are.
+    # They add no series. Oldest exemplars are overwritten first, and the buffer is not persisted beyond the WAL.
+    enableFeatures: [exemplar-storage]
+    exemplars:
+      maxSize: 100000
     # Pick up ServiceMonitors/PodMonitors/rules from any namespace without Helm release labels.
     serviceMonitorSelectorNilUsesHelmValues: false
     podMonitorSelectorNilUsesHelmValues: false

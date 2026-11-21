@@ -94,6 +94,15 @@ static class Driver
             return Results.Ok(new { labels = c, description = Labels.Describe(c), applied });
         });
 
+        // Trace sampling on every replica, live. Capped at 75% here as well as in each replica (Sampling.cs).
+        app.MapPost("/api/sampling", async (double ratio, ReplicaMonitor replicas) =>
+        {
+            if (!double.IsFinite(ratio) || ratio < 0 || ratio > TraceSampling.MaxRatio)
+                return Results.BadRequest(new { error = $"Trace sampling must be between 0% and {TraceSampling.MaxRatio * 100:0}%." });
+            var (applied, tracingOff, total) = await replicas.ApplySamplingAsync(ratio);
+            return Results.Ok(new { ratio, applied, tracingOff, total });
+        });
+
         // Restart the api replicas (rollout restart). Clears the SDK's in-memory series, which removing a
         // label does not: cumulative state keeps every series already created until the process restarts.
         app.MapPost("/api/replicas/restart", async (KubeClient kube, LoadTest test) =>
@@ -118,6 +127,7 @@ static class Driver
                     observed = replicas.ObservedDescription,
                     current = replicas.CurrentLabels,
                     currentDescription = Labels.Describe(replicas.CurrentLabels),
+                    sampling = replicas.Sampling,
                     pods = replicas.Latest,
                 },
                 replicaHistory = replicas.HistorySince(test.StartedAtUnix),
@@ -772,6 +782,55 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
         lock (_history) return ts == 0 ? [] : _history.Where(s => s.Ts >= ts).ToList();
     }
 
+    // Trace sampling ratio chosen in the console; re-applied to replicas that restart with the env default.
+    private double _desiredSampleRatio = double.NaN; // NaN = nothing chosen in the console yet
+    public double? DesiredSampleRatio
+    {
+        get { var r = Volatile.Read(ref _desiredSampleRatio); return double.IsNaN(r) ? null : r; }
+        private set => Volatile.Write(ref _desiredSampleRatio, value ?? double.NaN);
+    }
+
+    public object Sampling
+    {
+        get
+        {
+            var snaps = _views.Values.Where(v => v.Reachable && v.Stats is not null).Select(v => v.Stats!).ToList();
+            var on = snaps.Where(s => s.TracingEnabled).ToList();
+            var ratios = on.Select(s => s.TraceSampleRatio).Distinct().ToList();
+            return new
+            {
+                max = TraceSampling.MaxRatio,
+                desired = DesiredSampleRatio,
+                replicas = snaps.Count,
+                tracingOn = on.Count,
+                ratio = ratios.Count == 1 ? ratios[0] : (double?)null, // null: none on, or replicas disagree
+                mixed = ratios.Count > 1,
+            };
+        }
+    }
+
+    public async Task<(int Applied, int TracingOff, int Total)> ApplySamplingAsync(double ratio)
+    {
+        DesiredSampleRatio = ratio;
+        var ips = _views.Where(kv => kv.Value.Reachable).Select(kv => kv.Key).ToList(); // not pods that just left
+        var results = await Task.WhenAll(ips.Select(ip => SetSamplingAsync(ip, ratio)));
+        return (results.Count(r => r == SamplingResult.Applied), results.Count(r => r == SamplingResult.TracingOff), ips.Count);
+    }
+
+    private enum SamplingResult { Applied, TracingOff, Failed }
+
+    private async Task<SamplingResult> SetSamplingAsync(string ip, double ratio)
+    {
+        try
+        {
+            using var r = await _http.PostAsync(
+                $"http://{ip}:8080/admin/sampling?ratio={ratio.ToString(System.Globalization.CultureInfo.InvariantCulture)}", null);
+            return r.IsSuccessStatusCode ? SamplingResult.Applied
+                : r.StatusCode == HttpStatusCode.Conflict ? SamplingResult.TracingOff : SamplingResult.Failed;
+        }
+        catch { return SamplingResult.Failed; }
+    }
+
     public async Task<int> ApplyLabelsAsync(LabelConfig config)
     {
         var c = Labels.Normalize(config);
@@ -874,6 +933,8 @@ sealed class ReplicaMonitor(IConfiguration cfg, ILogger<ReplicaMonitor> log) : B
             // Restarted replicas come back with the env default; keep the chosen labels applied.
             var desired = DesiredLabels;
             if (desired is not null && snap.LabelKey != Labels.Key(desired)) await SetLabelsAsync(ip, desired);
+            var desiredRatio = DesiredSampleRatio;
+            if (desiredRatio is { } dr && snap.TracingEnabled && Math.Abs(snap.TraceSampleRatio - dr) > 1e-9) await SetSamplingAsync(ip, dr);
         }
         catch (Exception ex)
         {

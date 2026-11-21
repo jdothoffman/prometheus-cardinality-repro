@@ -45,6 +45,12 @@ spec:
             - { name: OTEL_EXPORTER_OTLP_PROTOCOL, value: http/protobuf }
             - { name: OTEL_METRIC_EXPORT_INTERVAL, value: "10000" }
             - { name: OTEL_METRIC_EXPORT_TIMEOUT, value: "8000" }
+            # Traces + exemplars (docs/tracing.md). Off = no tracing pipeline, as in every experiment run so far.
+            # `make traces-on RATIO=0.1` traces 10% of transactions (max 0.75: the app clamps anything higher);
+            # the console changes the ratio live. `make app` re-applies this (off).
+            - { name: TRACING_ENABLED, value: "false" }
+            - { name: TRACE_SAMPLE_RATIO, value: "0" }
+            - { name: METRIC_EXEMPLARS, value: trace_based }
             # Retry refused/failed exports (429/5xx/timeouts) with backoff, holding the payload in memory.
             # Opt-in in OpenTelemetry .NET; without it a refused export is simply dropped. Check what
             # production sets: retries are what turn an agent's push-back into pressure on the app.

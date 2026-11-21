@@ -179,6 +179,13 @@
       </div>
       <div class="note" id="modeNote">Applies to all replicas immediately.</div>
 
+      <div style="font-size:13px;margin-top:8px">Trace sampling <span class="hint">(share of transactions traced to Tempo, max 75%)</span></div>
+      <div class="actions" style="margin-top:4px;align-items:center">
+        <span><input id="sampleRatio" type="number" min="0" max="75" step="1" value="10" style="width:5em"> <span class="hint">%</span></span>
+        <button class="btn" id="applySampling">Apply sampling</button>
+      </div>
+      <div class="note" id="samplingNote">–</div>
+
       <label>Start rate <span><input id="startRate" type="number" value="50" min="1"> <span class="hint">req/s</span></span></label>
       <label>Step increase <span><input id="stepRate" type="number" value="50" min="0"> <span class="hint">req/s</span></span></label>
       <label>Step duration <span><input id="stepSeconds" type="number" value="30" min="5"> <span class="hint">s</span></span></label>
@@ -271,7 +278,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-let points = [], startedAt = 0, last = null, busy = false, labelsDirty = false;
+let points = [], startedAt = 0, last = null, busy = false, labelsDirty = false, samplingDirty = false;
 
 const fmtN = (v, d = 0) => v == null || isNaN(v) ? '–' : Number(v).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
 const fmtB = (b) => b == null ? '–' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GiB' : (b / 1048576).toFixed(0) + ' MiB';
@@ -378,6 +385,8 @@ function render(data) {
     : labelsDirty ? 'Not applied yet. Click Apply labels.'
     : rtOn ? `Now: ${data.replicas.currentDescription}. response_time ${cur0.responseTimeDecimals === -1 ? 'as 5 fixed latency bands is bounded' : `at ${cur0.responseTimeDecimals} dp ${cur0.responseTimeDecimals >= 4 ? 'makes nearly every request a new series' : 'is bucketed'}`}. Removing a label does not free series already in SDK memory: click Restart replicas.`
     : `Now: ${data.replicas.currentDescription}. Series already created stay in SDK memory until Restart replicas.`;
+
+  renderSampling(data.replicas.sampling);
 
   const running = t.state !== 'idle';
   $('kTarget').textContent = running ? fmtN(t.targetRate) : '–';
@@ -640,6 +649,34 @@ $('applyLabels').onclick = async () => {
       extraLabels: Number($('extraLabels').value), extraPoolSize: Number($('extraPool').value) }) });
   if (!r.ok) $('err').textContent = (await r.json()).error || 'Could not change labels';
   labelsDirty = false;
+  poll();
+};
+function renderSampling(sm) {
+  if (!sm) return;
+  const pct = r => `${Math.round(r * 1000) / 10}%`;
+  const off = sm.tracingOn === 0;
+  $('sampleRatio').disabled = $('applySampling').disabled = off;
+  $('sampleRatio').max = String(sm.max * 100);
+  if (!samplingDirty && sm.ratio != null) $('sampleRatio').value = String(Math.round(sm.ratio * 1000) / 10);
+  $('samplingNote').textContent = off
+    ? `Tracing is off on the replicas (started without it). Run make traces-on, then set the rate here. Cap: ${pct(sm.max)}.`
+    : sm.mixed ? `Replicas disagree (one is restarting?). Click Apply sampling to re-apply. Cap: ${pct(sm.max)}.`
+    : samplingDirty ? `Not applied yet. Cap: ${pct(sm.max)}.`
+    : `Now: ${pct(sm.ratio ?? 0)} of transactions traced on ${sm.tracingOn}/${sm.replicas} replicas. Cap: ${pct(sm.max)}, enforced by every replica.`;
+}
+$('sampleRatio').oninput = () => { samplingDirty = true; };
+$('applySampling').onclick = async () => {
+  const pctVal = Number($('sampleRatio').value);
+  const max = Number($('sampleRatio').max || 75);
+  if (!Number.isFinite(pctVal) || pctVal < 0 || pctVal > max) {
+    $('err').textContent = `Trace sampling must be between 0% and ${max}%.`;
+    return;
+  }
+  const r = await fetch(`/api/sampling?ratio=${pctVal / 100}`, { method: 'POST' });
+  const body = await r.json().catch(() => ({}));
+  $('err').textContent = !r.ok ? (body.error || 'Could not change sampling')
+    : body.tracingOff ? `${body.tracingOff} replica(s) have tracing off and kept 0%.` : '';
+  samplingDirty = false;
   poll();
 };
 $('restartReplicas').onclick = async () => {
