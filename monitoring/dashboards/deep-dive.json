@@ -1454,5 +1454,14 @@
       },
       "id": 32
     }
+  ],
+  "links": [
+    {
+      "title": "Repro Overview",
+      "type": "link",
+      "url": "/d/repro-overview",
+      "icon": "dashboard",
+      "keepTime": true
+    }
   ]
 }

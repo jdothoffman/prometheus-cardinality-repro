@@ -24,6 +24,7 @@ otelcol.receiver.otlp "default" {
   }
   output {
     metrics = [otelcol.processor.memory_limiter.default.input]
+    traces  = [otelcol.processor.memory_limiter.default.input]
   }
 }
 
@@ -33,6 +34,7 @@ otelcol.processor.memory_limiter "default" {
   spike_limit_percentage = 20
   output {
     metrics = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.default.input]
   }
 }
 
@@ -42,6 +44,7 @@ otelcol.processor.batch "default" {
   send_batch_max_size = 16384
   output {
     metrics = [otelcol.exporter.prometheus.default.input]
+    traces  = [otelcol.exporter.otlp.tempo.input]
   }
 }
 
@@ -74,5 +77,21 @@ prometheus.relabel "protect_prometheus" {
 prometheus.remote_write "prometheus" {
   endpoint {
     url = "http://kps-prometheus.monitoring.svc:9090/api/v1/write"
+    // Exemplars (trace ids) ride along with the samples. Prometheus keeps them in a fixed-size
+    // ring buffer (prometheusSpec.exemplars.maxSize), not as series.
+    send_exemplars = true
+  }
+}
+
+// TRACES: the app's sampled spans go through the same receiver (and memory_limiter, if any) and batch
+// processor as its metrics, then straight to Tempo. Nothing here turns spans into metrics: the only
+// trace <-> metric link is the exemplar the SDK attaches to a histogram/counter sample (docs/tracing.md).
+// Until `make tracing` + `make traces-on`, no spans arrive and this exporter stays idle.
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo.tracing.svc.cluster.local:4317"
+    tls {
+      insecure = true
+    }
   }
 }

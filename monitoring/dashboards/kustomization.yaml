@@ -13,3 +13,9 @@ configMapGenerator:
   - name: grafana-dashboard-deep-dive
     files:
       - deep-dive.json
+  - name: grafana-dashboard-traces
+    files:
+      - traces.json
+  - name: grafana-dashboard-overview
+    files:
+      - overview.json

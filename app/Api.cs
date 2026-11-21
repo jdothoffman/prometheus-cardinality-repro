@@ -22,6 +22,18 @@
 //   APPENDED_LABELS              0-8 identity labels (k8s node, pod uid, container id, ...) added to every
 //                                transaction series, as an observability team might append them (default 0)
 //   OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_METRIC_EXPORT_INTERVAL / OTEL_METRIC_EXPORT_TIMEOUT
+//
+// Traces and exemplars (docs/tracing.md):
+//   TRACE_SAMPLE_RATIO           share of transactions head-sampled in the SDK (spans → Alloy → Tempo).
+//                                0 (default) to 0.75: HARD CAP at 75%, higher values are clamped (see Sampling.cs).
+//                                Changeable live: POST /admin/sampling?ratio=…, or the console.
+//   TRACING_ENABLED              true | false; default: TRACE_SAMPLE_RATIO > 0. false = no tracing pipeline at
+//                                all, as in every run before tracing existed (the ratio can't be changed live).
+//   METRIC_EXEMPLARS             trace_based (default) | off. With tracing on, each histogram bucket / counter
+//                                series keeps the trace id of a recent SAMPLED request as an exemplar. An
+//                                exemplar is side data on a sample, not a label, so it adds no series. It
+//                                does cost SDK heap per metric point (one reservoir per series), so it
+//                                scales with the cardinality you already have.
 
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
@@ -31,9 +43,13 @@ using OpenTelemetry;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 static class Api
 {
+    // Spans this app creates itself, under the ASP.NET Core server span of each transaction.
+    public static readonly ActivitySource Tracer = new("Transactions.Api");
+
     public static void Configure(WebApplicationBuilder builder)
     {
         var cfg = builder.Configuration;
@@ -45,6 +61,12 @@ static class Api
         var endpoint = (cfg["OTEL_EXPORTER_OTLP_ENDPOINT"] ?? "http://localhost:4318").TrimEnd('/');
         var intervalMs = cfg.GetValue("OTEL_METRIC_EXPORT_INTERVAL", 10_000);
         var timeoutMs = cfg.GetValue("OTEL_METRIC_EXPORT_TIMEOUT", 8_000);
+        var requestedRatio = cfg.GetValue("TRACE_SAMPLE_RATIO", 0.0);
+        var tracing = cfg.GetValue("TRACING_ENABLED", requestedRatio > 0);
+        var sampling = new TraceSampling(tracing, requestedRatio, out var samplingWarning);
+        var exemplars = tracing && !string.Equals(cfg["METRIC_EXEMPLARS"], "off", StringComparison.OrdinalIgnoreCase);
+        builder.Services.AddSingleton(sampling);
+        if (samplingWarning is not null) Console.Error.WriteLine("warning: " + samplingWarning);
 
         var labels = new LabelSet(cfg["CARDINALITY_MODE"] ?? "bounded");
         var exportStats = new ExportStats(intervalMs, timeoutMs);
@@ -57,10 +79,31 @@ static class Api
         builder.Services.AddSingleton<TransactionMetrics>();
         builder.Services.AddSingleton<ReplicaStats>();
 
-        builder.Services.AddOpenTelemetry()
-            .ConfigureResource(r => r.AddService("transactions-api", serviceInstanceId: realPodName))
-            .WithMetrics(metrics =>
+        var otel = builder.Services.AddOpenTelemetry()
+            .ConfigureResource(r => r.AddService("transactions-api", serviceInstanceId: realPodName));
+
+        if (tracing)
+        {
+            otel.WithTracing(traces => traces
+                // Head sampling in the SDK: the decision is made before the request runs, so every exemplar
+                // (which is only taken from sampled requests) points at a trace that really was exported.
+                // Tail sampling in the agent would break that guarantee: see docs/tracing.md.
+                // Capped at 75%, changeable live, and not overridable by a caller's traceparent (Sampling.cs).
+                .SetSampler(new CappedRatioSampler(sampling))
+                .AddSource(Tracer.Name)
+                .AddAspNetCoreInstrumentation(o =>
+                    o.Filter = ctx => ctx.Request.Path.StartsWithSegments("/api")) // not /healthz, /admin/*
+                .AddOtlpExporter(o =>
+                {
+                    o.Endpoint = new Uri(endpoint + "/v1/traces");
+                    o.Protocol = OtlpExportProtocol.HttpProtobuf;
+                }));
+        }
+
+        otel.WithMetrics(metrics =>
             {
+                // trace_based: only measurements taken inside a sampled span can become exemplars.
+                metrics.SetExemplarFilter(exemplars ? ExemplarFilterType.TraceBased : ExemplarFilterType.AlwaysOff);
                 metrics
                     .AddMeter(TransactionMetrics.MeterName)
                     .AddAspNetCoreInstrumentation()
@@ -111,13 +154,22 @@ static class Api
         var cfg = app.Configuration;
         var cpuIterations = cfg.GetValue("CPU_WORK_ITERATIONS", 50);
         var labels = app.Services.GetRequiredService<LabelSet>();
+        var sampling = app.Services.GetRequiredService<TraceSampling>();
         _ = app.Services.GetRequiredService<TransactionMetrics>(); // create instruments eagerly
 
         app.Logger.LogInformation(
-            "transactions-api {Pod}: labels={Labels} VIRTUAL_PODS={Virtual} OTEL_CARDINALITY_LIMIT={Limit} scope={Scope} OTEL_ALLOWED_TAGS={Tags} CPU_WORK_ITERATIONS={Cpu} OTLP={Endpoint}",
+            "transactions-api {Pod}: labels={Labels} VIRTUAL_PODS={Virtual} OTEL_CARDINALITY_LIMIT={Limit} scope={Scope} OTEL_ALLOWED_TAGS={Tags} CPU_WORK_ITERATIONS={Cpu} OTLP={Endpoint} tracing={Tracing} sampling={Ratio} (max {Max}) METRIC_EXEMPLARS={Exemplars}",
             cfg["POD_NAME"] ?? Environment.MachineName, labels.Describe(), cfg.GetValue("VIRTUAL_PODS", 50),
             cfg.GetValue("OTEL_CARDINALITY_LIMIT", 200_000), cfg["OTEL_CARDINALITY_LIMIT_SCOPE"] ?? "transactions",
-            cfg["OTEL_ALLOWED_TAGS"] ?? "(all)", cpuIterations, cfg["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+            cfg["OTEL_ALLOWED_TAGS"] ?? "(all)", cpuIterations, cfg["OTEL_EXPORTER_OTLP_ENDPOINT"],
+            sampling.Enabled, sampling.Ratio, TraceSampling.MaxRatio, cfg["METRIC_EXEMPLARS"] ?? "trace_based");
+
+        // Trace sampling, live. Above the 75% cap → 400 and nothing changes (Sampling.cs).
+        app.MapGet("/admin/sampling", () => Results.Ok(sampling.Describe()));
+        app.MapPost("/admin/sampling", (double ratio) =>
+            sampling.TrySet(ratio, out var error)
+                ? Results.Ok(sampling.Describe())
+                : sampling.Enabled ? Results.BadRequest(new { error }) : Results.Conflict(new { error }));
 
         app.MapGet("/", () => Results.Content(
             """
@@ -129,7 +181,8 @@ static class Api
             <b>transactions-driver</b> Deployment: run <code>make ui</code> and open
             <a href="http://localhost:8080">http://localhost:8080</a>.</p>
             <p>Endpoints: <code>POST /api/transactions</code>, <code>GET /admin/stats</code>,
-            <code>GET|POST /admin/labels</code>, <code>GET|POST /admin/mode</code>, <code>GET /healthz</code>.</p></body></html>
+            <code>GET|POST /admin/labels</code>, <code>GET|POST /admin/mode</code>,
+            <code>GET|POST /admin/sampling?ratio=0..0.75</code>, <code>GET /healthz</code>.</p></body></html>
             """, "text/html"));
 
         app.MapGet("/healthz", () => Results.Ok("ok"));
@@ -167,13 +220,27 @@ static class Api
                 state = "cancelled"; // client gave up (e.g. its 3s timeout) before we finished
             }
             sw.Stop();
+            var normalizedConsumeType = Transactions.Normalize(consumeType, Transactions.ConsumeTypes);
+            var normalizedProduct = Transactions.Normalize(product, Transactions.Products);
 
-            // In-memory only; returns immediately. Never awaits the exporter.
-            metrics.Record(
-                Transactions.Normalize(consumeType, Transactions.ConsumeTypes),
-                state,
-                Transactions.Normalize(product, Transactions.Products),
-                sw.Elapsed);
+            // Per-request detail belongs on the span, not on a metric label: Tempo stores it per trace
+            // and TraceQL can search it, at no cost to Prometheus. This is where an exact response time,
+            // a transaction id or a tenant id can go (compare the response_time/GUID labels under test).
+            // The same keys as the metric labels let Grafana jump from a span to its metric slice.
+            if (Activity.Current is { IsAllDataRequested: true } span)
+            {
+                span.SetTag("transaction.id", Guid.NewGuid().ToString("N"));
+                span.SetTag("transaction.product", normalizedProduct);
+                span.SetTag("transaction.consume_type", normalizedConsumeType);
+                span.SetTag("transaction.state", state);
+                span.SetTag("transaction.response_time_ms", Math.Round(sw.Elapsed.TotalMilliseconds, 3));
+                if (state == "failed") span.SetStatus(ActivityStatusCode.Error, "transaction failed");
+            }
+
+            // In-memory only; returns immediately. Never awaits the exporter. Runs inside the request's
+            // span, so with exemplars on, a sampled request can leave its trace id on the bucket it hit.
+            metrics.Record(normalizedConsumeType, state, normalizedProduct, sw.Elapsed,
+                traced: Activity.Current?.Recorded == true);
             stats.OnTransaction(state == "cancelled");
 
             // Business outcomes (completed/pending/declined/failed) are all HTTP 200; HTTP errors and
@@ -203,17 +270,31 @@ static class Transactions
     {
         // Simulated CPU work (validation, serialization, crypto). Under a CPU limit this is what
         // queues up when the pod is starved.
-        Span<byte> hash = stackalloc byte[32];
-        for (var i = 0; i < cpuIterations; i++) SHA256.HashData(Payload, hash);
+        // Spans are only created for sampled requests (StartActivity returns null otherwise).
+        using (Api.Tracer.StartActivity("transaction.validate"))
+        {
+            Validate(cpuIterations);
+        }
 
+        using var downstream = Api.Tracer.StartActivity("ledger.post", ActivityKind.Client);
+        downstream?.SetTag("peer.service", "ledger");
         await Task.Delay(Random.Shared.Next(3, 60), ct); // simulated downstream call
-        return Random.Shared.Next(100) switch
+        var state = Random.Shared.Next(100) switch
         {
             < 85 => "completed",
             < 92 => "pending",
             < 97 => "declined",
             _ => "failed",
         };
+        if (state == "failed") downstream?.SetStatus(ActivityStatusCode.Error, "ledger rejected the posting");
+        return state;
+    }
+
+    // Not inlined into the async method: a stackalloc can't live across an await.
+    private static void Validate(int cpuIterations)
+    {
+        Span<byte> hash = stackalloc byte[32];
+        for (var i = 0; i < cpuIterations; i++) SHA256.HashData(Payload, hash);
     }
 }
 
@@ -347,9 +428,11 @@ sealed class TransactionMetrics
     private readonly VirtualPods _pods;
     private readonly Counter<long> _transactions;
     private readonly Histogram<double> _duration;
+    private readonly Counter<long> _traced;
     private readonly KeyValuePair<string, object?>[] _appended;
 
-    public TransactionMetrics(IMeterFactory meterFactory, LabelSet labels, VirtualPods pods, ExportStats export, IConfiguration cfg)
+    public TransactionMetrics(IMeterFactory meterFactory, LabelSet labels, VirtualPods pods, ExportStats export, IConfiguration cfg,
+        TraceSampling sampling)
     {
         _labels = labels;
         _pods = pods;
@@ -358,10 +441,31 @@ sealed class TransactionMetrics
         // -> http_transactions_total, http_transaction_duration_seconds_*, transactions_cardinality_unbounded
         _transactions = meter.CreateCounter<long>(TransactionsName, description: "HTTP transactions processed");
         _duration = meter.CreateHistogram<double>(DurationName, unit: "s", description: "Transaction response time");
+        // No labels: observed sampled share = rate(transactions_traced_total) / rate(http_transactions_total).
+        _traced = meter.CreateCounter<long>("transactions.traced", description: "Transactions whose trace was sampled (exported to Tempo)");
         meter.CreateObservableGauge("transactions.cardinality.unbounded", () => _labels.IsUnbounded ? 1 : 0,
             description: "1 when response_time is being emitted as a label");
         meter.CreateObservableGauge("transactions.virtual.pods", () => _pods.Count,
             description: "Simulated pod names emitted by this replica");
+        // Run settings as one series per pod each, so dashboards can show what a run is configured with.
+        var cardinalityLimit = cfg.GetValue("OTEL_CARDINALITY_LIMIT", 200_000);
+        var limitAll = string.Equals(cfg["OTEL_CARDINALITY_LIMIT_SCOPE"], "all", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        var exemplarsOn = sampling.Enabled && !string.Equals(cfg["METRIC_EXEMPLARS"], "off", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        var allowList = string.IsNullOrWhiteSpace(cfg["OTEL_ALLOWED_TAGS"]) ? 0 : 1;
+        meter.CreateObservableGauge("transactions.config.cardinality.limit", () => cardinalityLimit,
+            description: "OTEL_CARDINALITY_LIMIT this replica runs with");
+        meter.CreateObservableGauge("transactions.config.cardinality.limit.all", () => limitAll,
+            description: "1 when the cardinality limit applies to every instrument (OTEL_CARDINALITY_LIMIT_SCOPE=all)");
+        meter.CreateObservableGauge("transactions.config.tag.allowlist", () => allowList,
+            description: "1 when the OTEL_ALLOWED_TAGS View (fix F1) is on");
+        meter.CreateObservableGauge("transactions.config.appended.labels", () => _appended.Length,
+            description: "Identity labels appended to every transaction series (APPENDED_LABELS)");
+        meter.CreateObservableGauge("transactions.config.trace.sample.ratio", () => sampling.Ratio,
+            description: "Configured trace sampling ratio, live (0 = off); never above the cap");
+        meter.CreateObservableGauge("transactions.config.trace.sample.ratio.max", () => TraceSampling.MaxRatio,
+            description: "Hard cap on the trace sampling ratio");
+        meter.CreateObservableGauge("transactions.config.exemplars", () => exemplarsOn,
+            description: "1 when sampled requests leave exemplars (trace ids) on the metrics");
 
         // The exporter's own cost, reported through the same pipeline (so it has gaps when that breaks;
         // the driver also polls these directly from /admin/stats).
@@ -377,8 +481,9 @@ sealed class TransactionMetrics
             description: "OTLP HTTP requests beyond the first per export (retries after 429/5xx/timeouts)");
     }
 
-    public void Record(string consumeType, string state, string product, TimeSpan elapsed)
+    public void Record(string consumeType, string state, string product, TimeSpan elapsed, bool traced = false)
     {
+        if (traced) _traced.Add(1);
         // Response time as a proper value: bounded histogram (pod comes from the resource/instance).
         var durationTags = new TagList { { "consume_type", consumeType }, { "state", state }, { "product", product } };
         foreach (var a in _appended) durationTags.Add(a);
@@ -591,7 +696,7 @@ static class AppendedLabels
 
 // Point-in-time resource stats for this replica, read by the driver (GET /admin/stats).
 // Reads cgroup v2 files so the numbers match what the kubelet / OOM killer see.
-sealed class ReplicaStats(LabelSet labels, VirtualPods pods, ExportStats export, IConfiguration cfg)
+sealed class ReplicaStats(LabelSet labels, VirtualPods pods, ExportStats export, IConfiguration cfg, TraceSampling sampling)
 {
     private readonly long _startedMs = Environment.TickCount64;
     private readonly string _pod = cfg["POD_NAME"] ?? Environment.MachineName;
@@ -620,6 +725,8 @@ sealed class ReplicaStats(LabelSet labels, VirtualPods pods, ExportStats export,
             ExtraLabels = labels.ExtraLabels,
             ExtraPoolSize = labels.ExtraPoolSize,
             LabelKey = labels.Key,
+            TracingEnabled = sampling.Enabled,
+            TraceSampleRatio = sampling.Ratio,
             SampledAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             UptimeSeconds = (Environment.TickCount64 - _startedMs) / 1000.0,
             MemoryCurrentBytes = ReadLong("/sys/fs/cgroup/memory.current") ?? Environment.WorkingSet,
@@ -704,6 +811,8 @@ sealed class ReplicaSnapshot
     public int ExtraLabels { get; set; }
     public int ExtraPoolSize { get; set; }
     public string LabelKey { get; set; } = "";
+    public bool TracingEnabled { get; set; }
+    public double TraceSampleRatio { get; set; }
     public long SampledAtUnixMs { get; set; }
     public double UptimeSeconds { get; set; }
     public long MemoryCurrentBytes { get; set; }
